@@ -1,0 +1,14 @@
+VLCKit / libVLC
+Copyright © VLC authors, VideoLAN and Videolabs.
+
+本应用动态链接 VideoLAN 的 VLCKit，用于应用内的本地媒体解码。
+VLCKit 按 GNU Lesser General Public License 2.1 或后续版本提供。
+完整许可文本见同目录 VLCKit-COPYING.txt。
+
+源代码：https://github.com/videolan/vlckit
+源码提交：3d0f0fa7031eab1a67c817c98a495e1c68fc998c
+官方二进制：https://download.videolan.org/cocoapods/unstable/VLCKit-4.0-20261109-1916.zip
+二进制 SHA-256：1fec7232f88e706f44d9a015133e08d742166eb2666cb44915c9f570bf339463
+
+上游源码、依赖源码及构建流程由上述源码仓库、libvlc 目录和 compileAndBuildVLCKit.sh 提供。
+本应用没有修改 VLCKit 源码；依赖固定到上述源码提交。

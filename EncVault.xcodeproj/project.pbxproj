@@ -1,0 +1,668 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		F50000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = "Media/DocumentThumbnail.swift";
+			sourceTree = "<group>";
+		};
+		F50000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = F50000000000000000000001;
+		};
+		F50000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = F50000000000000000000001;
+		};
+		F40000000000000000000001 = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ("$(SRCROOT)/Scripts/package-pages-reader.py", "$(SRCROOT)/Resources/PagesReader.entitlements", "$(SRCROOT)/Sources/Helpers/PagesReader.cpp",);
+			name = "Package offline Pages reader";
+			outputPaths = ();
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "set -euo pipefail\npython3 \"$SRCROOT/Scripts/package-pages-reader.py\" \"$TARGET_BUILD_DIR/$WRAPPER_NAME\" \"$EXPANDED_CODE_SIGN_IDENTITY\"\n";
+		};
+		F30000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = "Core/VaultDocument.swift";
+			sourceTree = "<group>";
+		};
+		F30000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = F30000000000000000000001;
+		};
+		F30000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = F30000000000000000000001;
+		};
+		F30000000000000000000004 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = "UI/DocumentViewer.swift";
+			sourceTree = "<group>";
+		};
+		F30000000000000000000005 = {
+			isa = PBXBuildFile;
+			fileRef = F30000000000000000000004;
+		};
+		F30000000000000000000006 = {
+			isa = PBXBuildFile;
+			fileRef = F30000000000000000000004;
+		};
+		F20000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.c.objc;
+			path = "Media/VaultStreamMedia.m";
+			sourceTree = "<group>";
+		};
+		F20000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = F20000000000000000000001;
+		};
+		F20000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = F20000000000000000000001;
+		};
+		F20000000000000000000004 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.c.h;
+			path = "Media/VaultStreamMedia.h";
+			sourceTree = "<group>";
+		};
+		F10000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = folder;
+			path = ThirdParty;
+			sourceTree = "<group>";
+		};
+		F10000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = F10000000000000000000001;
+		};
+		F10000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = F10000000000000000000001;
+		};
+		AF00000000000000000000001 = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/videolan/vlckit.git";
+			requirement = {
+				kind = revision;
+				revision = 3d0f0fa7031eab1a67c817c98a495e1c68fc998c;
+			};
+		};
+		AF00000000000000000000002 = {
+			isa = XCSwiftPackageProductDependency;
+			package = AF00000000000000000000001;
+			productName = VLCKit;
+		};
+		AF00000000000000000000003 = {
+			isa = PBXBuildFile;
+			productRef = AF00000000000000000000002;
+		};
+		AF00000000000000000000004 = {
+			isa = PBXBuildFile;
+			productRef = AF00000000000000000000002;
+		};
+		AE00000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = "UI/IOSMediaScroll.swift";
+			sourceTree = "<group>";
+		};
+		AE00000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = AE00000000000000000000001;
+		};
+		AE00000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = AE00000000000000000000001;
+		};
+		AD00000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = "UI/MacMediaGestures.swift";
+			sourceTree = "<group>";
+		};
+		AD00000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = AD00000000000000000000001;
+		};
+		AD00000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = AD00000000000000000000001;
+		};
+		AC00000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = "Media/MediaThumbnail.swift";
+			sourceTree = "<group>";
+		};
+		AC00000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = AC00000000000000000000001;
+		};
+		AC00000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = AC00000000000000000000001;
+		};
+		AB00000000000000000000001 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = ImageViewer.swift;
+			sourceTree = "<group>";
+		};
+		AB00000000000000000000002 = {
+			isa = PBXBuildFile;
+			fileRef = AB00000000000000000000001;
+		};
+		AB00000000000000000000003 = {
+			isa = PBXBuildFile;
+			fileRef = AB00000000000000000000001;
+		};
+		A00000000000000000000001 = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = A00000000000000000000501;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = "zh-Hans";
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				"zh-Hans",
+				en,
+				Base,
+			);
+			mainGroup = A00000000000000000000010;
+			productRefGroup = A00000000000000000000020;
+			projectDirPath = "";
+			projectRoot = "";
+			packageReferences = (
+				AF00000000000000000000001,
+			);
+			targets = (
+				A00000000000000000000401,
+				A00000000000000000000402,
+			);
+		};
+		A00000000000000000000010 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000011,
+				A00000000000000000000015,
+				A00000000000000000000020,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000011 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000012,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000012 = {
+			isa = PBXGroup;
+			children = (
+				F30000000000000000000001,
+				F50000000000000000000001,
+				F30000000000000000000004,
+				F20000000000000000000001,
+				F20000000000000000000004,
+				AE00000000000000000000001,
+				AD00000000000000000000001,
+				AC00000000000000000000001,
+				F00000000000000000000001,
+				D00000000000000000000001,
+				B00000000000000000000001,
+				B00000000000000000000002,
+				B00000000000000000000003,
+				B00000000000000000000004,
+				B00000000000000000000005,
+				B00000000000000000000006,
+				B00000000000000000000007,
+				B00000000000000000000008,
+				B00000000000000000000009,
+				B0000000000000000000000A,
+				B0000000000000000000000B,
+				B0000000000000000000000C,
+				A00000000000000000000013,
+				A00000000000000000000014,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000013 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000101,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000014 = {
+			isa = PBXGroup;
+			children = (
+				AB00000000000000000000001,
+				A00000000000000000000102,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000015 = {
+			isa = PBXGroup;
+			children = (
+				F10000000000000000000001,
+				E00000000000000000000001,
+				A00000000000000000000103,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000020 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000701,
+				A00000000000000000000702,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000101 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = EncVaultApp.swift;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000102 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.swift;
+			path = VaultLandingView.swift;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000103 = {
+			isa = PBXFileReference;
+			lastKnownFileType = text.plist.entitlements;
+			path = "EncVault-macOS.entitlements";
+			sourceTree = "<group>";
+		};
+		A00000000000000000000201 = {
+			isa = PBXBuildFile;
+			fileRef = A00000000000000000000101;
+		};
+		A00000000000000000000202 = {
+			isa = PBXBuildFile;
+			fileRef = A00000000000000000000102;
+		};
+		A00000000000000000000203 = {
+			isa = PBXBuildFile;
+			fileRef = A00000000000000000000101;
+		};
+		A00000000000000000000204 = {
+			isa = PBXBuildFile;
+			fileRef = A00000000000000000000102;
+		};
+		A00000000000000000000301 = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F30000000000000000000002,
+				F50000000000000000000002,
+				F30000000000000000000005,
+				F20000000000000000000002,
+				AE00000000000000000000002,
+				AD00000000000000000000002,
+				AC00000000000000000000002,
+				AB00000000000000000000002,
+				F00000000000000000000002,
+				D00000000000000000000002,
+				C10000000000000000000001,
+				C10000000000000000000002,
+				C10000000000000000000003,
+				C10000000000000000000004,
+				C10000000000000000000005,
+				C10000000000000000000006,
+				C10000000000000000000007,
+				C10000000000000000000008,
+				C10000000000000000000009,
+				C1000000000000000000000A,
+				C1000000000000000000000B,
+				C1000000000000000000000C,
+				A00000000000000000000201,
+				A00000000000000000000202,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000302 = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F30000000000000000000003,
+				F50000000000000000000003,
+				F30000000000000000000006,
+				F20000000000000000000003,
+				AE00000000000000000000003,
+				AD00000000000000000000003,
+				AC00000000000000000000003,
+				AB00000000000000000000003,
+				F00000000000000000000003,
+				D00000000000000000000003,
+				C20000000000000000000001,
+				C20000000000000000000002,
+				C20000000000000000000003,
+				C20000000000000000000004,
+				C20000000000000000000005,
+				C20000000000000000000006,
+				C20000000000000000000007,
+				C20000000000000000000008,
+				C20000000000000000000009,
+				C2000000000000000000000A,
+				C2000000000000000000000B,
+				C2000000000000000000000C,
+				A00000000000000000000203,
+				A00000000000000000000204,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000303 = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AF00000000000000000000003,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000304 = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AF00000000000000000000004,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000305 = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (E00000000000000000000002, F10000000000000000000002,);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000306 = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (E00000000000000000000003, F10000000000000000000003,);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A00000000000000000000401 = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000502;
+			buildPhases = (
+				A00000000000000000000301,
+				A00000000000000000000303,
+				A00000000000000000000305,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = "EncVault-iOS";
+			packageProductDependencies = (
+				AF00000000000000000000002,
+			);
+			productName = EncVault;
+			productReference = A00000000000000000000701;
+			productType = "com.apple.product-type.application";
+		};
+		A00000000000000000000402 = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000503;
+			buildPhases = (
+				A00000000000000000000302,
+				A00000000000000000000304,
+				A00000000000000000000306,
+				F40000000000000000000001,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = "EncVault-macOS";
+			packageProductDependencies = (
+				AF00000000000000000000002,
+			);
+			productName = EncVault;
+			productReference = A00000000000000000000702;
+			productType = "com.apple.product-type.application";
+		};
+		A00000000000000000000501 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000601,
+				A00000000000000000000602,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000502 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000603,
+				A00000000000000000000604,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000503 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000605,
+				A00000000000000000000606,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000601 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_ARC = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/Shared/Media/VaultStreamMedia.h";
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A00000000000000000000602 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_ARC = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/Shared/Media/VaultStreamMedia.h";
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		A00000000000000000000603 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_KEY_CFBundleDisplayName = EncVault;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "仅在你选择时读取本机照片或视频，加密复验后按你的确认处理原件。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "仅在你确认导出时，将解密后的原名图片或视频保存到系统照片。";
+				INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = local.encvault.ios;
+				PRODUCT_NAME = EncVault;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		A00000000000000000000604 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_KEY_CFBundleDisplayName = EncVault;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "仅在你选择时读取本机照片或视频，加密复验后按你的确认处理原件。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "仅在你确认导出时，将解密后的原名图片或视频保存到系统照片。";
+				INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = local.encvault.ios;
+				PRODUCT_NAME = EncVault;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		A00000000000000000000605 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "Resources/EncVault-macOS.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_KEY_CFBundleDisplayName = EncVault;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "仅在你选择时读取本机照片或视频，加密复验后按你的确认处理原件。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "仅在你确认导出时，将解密后的原名图片或视频保存到系统照片。";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSQuitAlwaysKeepsWindows = NO;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = local.encvault.macos;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+				PRODUCT_NAME = EncVault;
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+			};
+			name = Debug;
+		};
+		A00000000000000000000606 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "Resources/EncVault-macOS.entitlements";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_KEY_CFBundleDisplayName = EncVault;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "仅在你选择时读取本机照片或视频，加密复验后按你的确认处理原件。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "仅在你确认导出时，将解密后的原名图片或视频保存到系统照片。";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSQuitAlwaysKeepsWindows = NO;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = local.encvault.macos;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+				PRODUCT_NAME = EncVault;
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+			};
+			name = Release;
+		};
+		A00000000000000000000701 = {
+			isa = PBXFileReference;
+			explicitFileType = wrapper.application;
+			includeInIndex = 0;
+			name = "EncVault-iOS.app";
+			path = EncVault.app;
+			sourceTree = BUILT_PRODUCTS_DIR;
+		};
+		A00000000000000000000702 = {
+			isa = PBXFileReference;
+			explicitFileType = wrapper.application;
+			includeInIndex = 0;
+			name = "EncVault-macOS.app";
+			path = EncVault.app;
+			sourceTree = BUILT_PRODUCTS_DIR;
+		};
+		B00000000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Core/KeychainSecrets.swift"; sourceTree = "<group>"; };
+		C10000000000000000000001 = { isa = PBXBuildFile; fileRef = B00000000000000000000001; };
+		C20000000000000000000001 = { isa = PBXBuildFile; fileRef = B00000000000000000000001; };
+		B00000000000000000000002 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Core/VaultCrypto.swift"; sourceTree = "<group>"; };
+		C10000000000000000000002 = { isa = PBXBuildFile; fileRef = B00000000000000000000002; };
+		C20000000000000000000002 = { isa = PBXBuildFile; fileRef = B00000000000000000000002; };
+		B00000000000000000000003 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Core/VaultMediaFile.swift"; sourceTree = "<group>"; };
+		C10000000000000000000003 = { isa = PBXBuildFile; fileRef = B00000000000000000000003; };
+		C20000000000000000000003 = { isa = PBXBuildFile; fileRef = B00000000000000000000003; };
+		B00000000000000000000004 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Core/VaultStorage.swift"; sourceTree = "<group>"; };
+		C10000000000000000000004 = { isa = PBXBuildFile; fileRef = B00000000000000000000004; };
+		C20000000000000000000004 = { isa = PBXBuildFile; fileRef = B00000000000000000000004; };
+		B00000000000000000000005 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Core/VaultStore.swift"; sourceTree = "<group>"; };
+		C10000000000000000000005 = { isa = PBXBuildFile; fileRef = B00000000000000000000005; };
+		C20000000000000000000005 = { isa = PBXBuildFile; fileRef = B00000000000000000000005; };
+		B00000000000000000000006 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Core/VaultTypes.swift"; sourceTree = "<group>"; };
+		C10000000000000000000006 = { isa = PBXBuildFile; fileRef = B00000000000000000000006; };
+		C20000000000000000000006 = { isa = PBXBuildFile; fileRef = B00000000000000000000006; };
+		B00000000000000000000007 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Media/EncryptedMediaResource.swift"; sourceTree = "<group>"; };
+		C10000000000000000000007 = { isa = PBXBuildFile; fileRef = B00000000000000000000007; };
+		C20000000000000000000007 = { isa = PBXBuildFile; fileRef = B00000000000000000000007; };
+		B00000000000000000000008 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Media/LocalPlayback.swift"; sourceTree = "<group>"; };
+		C10000000000000000000008 = { isa = PBXBuildFile; fileRef = B00000000000000000000008; };
+		C20000000000000000000008 = { isa = PBXBuildFile; fileRef = B00000000000000000000008; };
+		B00000000000000000000009 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UI/CredentialControls.swift"; sourceTree = "<group>"; };
+		C10000000000000000000009 = { isa = PBXBuildFile; fileRef = B00000000000000000000009; };
+		C20000000000000000000009 = { isa = PBXBuildFile; fileRef = B00000000000000000000009; };
+		B0000000000000000000000A = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UI/PlayerSurface.swift"; sourceTree = "<group>"; };
+		C1000000000000000000000A = { isa = PBXBuildFile; fileRef = B0000000000000000000000A; };
+		C2000000000000000000000A = { isa = PBXBuildFile; fileRef = B0000000000000000000000A; };
+		B0000000000000000000000B = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UI/VaultModel.swift"; sourceTree = "<group>"; };
+		C1000000000000000000000B = { isa = PBXBuildFile; fileRef = B0000000000000000000000B; };
+		C2000000000000000000000B = { isa = PBXBuildFile; fileRef = B0000000000000000000000B; };
+		B0000000000000000000000C = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UI/VaultWindowProtection.swift"; sourceTree = "<group>"; };
+		C1000000000000000000000C = { isa = PBXBuildFile; fileRef = B0000000000000000000000C; };
+		C2000000000000000000000C = { isa = PBXBuildFile; fileRef = B0000000000000000000000C; };
+		D00000000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Media/PhotoVaultService.swift"; sourceTree = "<group>"; };
+		D00000000000000000000002 = { isa = PBXBuildFile; fileRef = D00000000000000000000001; };
+		D00000000000000000000003 = { isa = PBXBuildFile; fileRef = D00000000000000000000001; };
+		E00000000000000000000001 = { isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		E00000000000000000000002 = { isa = PBXBuildFile; fileRef = E00000000000000000000001; };
+		E00000000000000000000003 = { isa = PBXBuildFile; fileRef = E00000000000000000000001; };
+		F00000000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "UI/MediaAlbum.swift"; sourceTree = "<group>"; };
+		F00000000000000000000002 = { isa = PBXBuildFile; fileRef = F00000000000000000000001; };
+		F00000000000000000000003 = { isa = PBXBuildFile; fileRef = F00000000000000000000001; };
+	};
+	rootObject = A00000000000000000000001;
+}
