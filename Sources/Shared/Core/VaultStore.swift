@@ -158,21 +158,22 @@ final class VaultStore: @unchecked Sendable {
   /// 参数说明：
   /// - `current`：本次策略变更所使用的有效会话。
   /// - `folders`：切换前必须仍然有效的目录授权。
-  /// 返回：使用同一主密钥的新会话，所有目录权限清空；失权时不创建替代能力。
+  /// 返回：使用同一主密钥并保留当前 ROOT 激活的新会话，目录权限清空；失权时不创建替代能力。
   func rotateSession(using current: VaultGrant, folders: [UUID: UUID] = [:]) throws -> VaultGrant {
     transaction.lock()
     defer {
       transaction.unlock()
     }
     try authorize(current)
+    let rootToken = try current.rootToken()
     grantsLock.lock()
     let transition: (VaultGrant, [VaultGrant])
     do {
       guard grants.contains(where: { $0 === current }) else {
         throw VaultError.locked
       }
-      transition = try current.access(folders: folders) { root in
-        let replacement = VaultGrant(root: root, vaultID: current.vaultID)
+      transition = try current.access(folders: folders, rootToken: rootToken) { root in
+        let replacement = VaultGrant(root: root, vaultID: current.vaultID, rootToken: rootToken)
         let previous = grants
         // 在同一门禁内登记新能力；并发锁定要么先拒绝旧能力，要么能撤销已登记的新能力。
         grants = [replacement]
@@ -212,6 +213,134 @@ final class VaultStore: @unchecked Sendable {
       throw VaultError.corrupt
     }
     return result
+  }
+
+  /// 业务作用：读取主密钥保护的 ROOT 密码材料，不把独立密码与 App 凭据封装混用。
+  /// 参数说明：
+  /// - `grant`：当前已解锁的 App 会话。
+  /// 返回：已设置时返回认证材料，首次未设置时为空；密文损坏时明确拒绝。
+  private func rootPassword(using grant: VaultGrant) throws -> RootPassword? {
+    try authorize(grant)
+    let url = directory.appendingPathComponent("root-password.evp")
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      return nil
+    }
+    let bytes = try Data(contentsOf: url, options: .mappedIfSafe)
+    guard bytes.count <= 65_536 else {
+      throw VaultError.corrupt
+    }
+    return try grant.access { root in
+      let context = Data("EncVault/root-settings/\(grant.vaultID)".utf8)
+      let value = try VaultCrypto.open(
+        bytes, key: VaultCrypto.key(root, context: context), context: context)
+      return try JSONDecoder().decode(RootPassword.self, from: value)
+    }
+  }
+
+  /// 业务作用：判断开启 ROOT 前是否必须先设置独立密码，不开放 ROOT 权限。
+  /// 参数说明：
+  /// - `grant`：当前已解锁的 App 会话。
+  /// 返回：已存在且能认证 ROOT 材料时为真；未设置为假，损坏或失权时抛错。
+  func hasRootPassword(using grant: VaultGrant) throws -> Bool {
+    transaction.lock()
+    defer {
+      transaction.unlock()
+    }
+    return try rootPassword(using: grant) != nil
+  }
+
+  /// 业务作用：首次设置独立 ROOT 密码并原子保存认证材料，设置本身不启用 ROOT。
+  /// 参数说明：
+  /// - `password`：用户已经重复确认的新 ROOT 文本密码。
+  /// - `grant`：仍有效的 App 会话。
+  /// 返回：材料完整落盘后成功，随后仍需验证才可开启；已有密码或发布不明时不开放权限。
+  func setRootPassword(_ password: String, using grant: VaultGrant) throws {
+    transaction.lock()
+    defer {
+      transaction.unlock()
+    }
+    guard try rootPassword(using: grant) == nil else {
+      throw VaultError.rootAlreadyConfigured
+    }
+    try commitRootPassword(password, using: grant)
+  }
+
+  /// 业务作用：修改 ROOT 密码前独立验证原 ROOT 密码，不接受 App 或目录密码替代。
+  /// 参数说明：
+  /// - `previous`：本次输入的原 ROOT 密码。
+  /// - `password`：用户两次确认一致的新 ROOT 密码。
+  /// - `grant`：已开启 ROOT 且仍有效的 App 会话。
+  /// 返回：保存新材料并关闭全部 ROOT 激活；原密码错误或新密码非法时保留原材料与状态。
+  func changeRootPassword(previous: String, password: String, using grant: VaultGrant) throws {
+    transaction.lock()
+    defer {
+      transaction.unlock()
+    }
+    guard try grant.rootToken() != nil else {
+      throw VaultError.rootRequired
+    }
+    guard let protection = try rootPassword(using: grant) else {
+      throw VaultError.rootNotConfigured
+    }
+    try VaultCrypto.verifyRootPassword(previous, protection: protection, using: grant)
+    try commitRootPassword(password, using: grant)
+  }
+
+  /// 业务作用：先验证新的 ROOT 材料，再撤销旧 ROOT 能力并原子发布认证密文。
+  /// 参数说明：
+  /// - `password`：本次需要保存的新 ROOT 密码，原文不落盘。
+  /// - `grant`：已通过设置或改密前置检查的 App 会话。
+  /// 返回：新材料回读一致后成功，保存不明时锁定，不沿用旧 ROOT 能力。
+  private func commitRootPassword(_ password: String, using grant: VaultGrant) throws {
+    let protection = try VaultCrypto.rootPassword(password, using: grant)
+    try VaultCrypto.verifyRootPassword(password, protection: protection, using: grant)
+    let bytes = try grant.access { root in
+      let context = Data("EncVault/root-settings/\(grant.vaultID)".utf8)
+      return try VaultCrypto.seal(
+        VaultCrypto.encode(protection), key: VaultCrypto.key(root, context: context),
+        context: context)
+    }
+    try Task.checkCancellation()
+    grantsLock.lock()
+    let activeGrants = grants
+    grantsLock.unlock()
+    // 发布新密码前先撤销全部 ROOT 激活，旧密码取得的能力不能跨过密码变更继续交付隐藏内容。
+    for active in activeGrants {
+      active.deactivateRoot()
+    }
+    // 设置只发布校验密文，不生成 ROOT 激活身份；落盘与回读完成前不能开放隐藏目录。
+    do {
+      try grant.access { _ in
+        try VaultStorage.atomicWrite(
+          bytes, to: directory.appendingPathComponent("root-password.evp"))
+      }
+      guard try rootPassword(using: grant) == protection else {
+        throw VaultError.corrupt
+      }
+    } catch {
+      lock()
+      throw VaultError.rootCommitUncertain
+    }
+  }
+
+  /// 业务作用：每次开启 ROOT 都重新验证独立 ROOT 密码，不能沿用 App 或目录验证。
+  /// 参数说明：
+  /// - `password`：本次输入的 ROOT 密码。
+  /// - `grant`：发起开启请求的当前 App 会话。
+  /// 返回：验证正确后发放新的内存激活身份；未设置、错误、取消或失权时保持关闭。
+  func enableRoot(password: String, using grant: VaultGrant) throws {
+    transaction.lock()
+    defer {
+      transaction.unlock()
+    }
+    guard let protection = try rootPassword(using: grant) else {
+      throw VaultError.rootNotConfigured
+    }
+    try VaultCrypto.verifyRootPassword(password, protection: protection, using: grant)
+    try authorize(grant)
+    try Task.checkCancellation()
+    // 密码验证完成后才发布 ROOT 能力，锁定后的迟到验证不能重新激活会话。
+    try grant.activateRoot()
   }
 
   /// 业务作用：为首次设置准备密码封装和一次性恢复码，确认前不发布有效凭据。
@@ -475,9 +604,18 @@ final class VaultStore: @unchecked Sendable {
     let current = try? header()
     try FileManager.default.removeItem(at: mediaDirectory)
     try VaultStorage.directory(mediaDirectory)
+    let migrationDirectory = directory.appendingPathComponent(
+      "migration.noindex", isDirectory: true)
+    if FileManager.default.fileExists(atPath: migrationDirectory.path) {
+      try FileManager.default.removeItem(at: migrationDirectory)
+    }
     let headerURL = directory.appendingPathComponent("vault.json")
     if FileManager.default.fileExists(atPath: headerURL.path) {
       try FileManager.default.removeItem(at: headerURL)
+    }
+    let rootPasswordURL = directory.appendingPathComponent("root-password.evp")
+    if FileManager.default.fileExists(atPath: rootPasswordURL.path) {
+      try FileManager.default.removeItem(at: rootPasswordURL)
     }
     try VaultStorage.synchronizeDirectory(directory)
     if let current {

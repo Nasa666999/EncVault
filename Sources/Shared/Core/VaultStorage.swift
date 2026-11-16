@@ -98,6 +98,7 @@ final class VaultGrant: @unchecked Sendable {
   private var root: Data?
   private var active = true
   private var folderAccess: [UUID: UUID] = [:]
+  private var rootActivation: UUID?
   private let parent: VaultGrant?
   let vaultID: UUID
 
@@ -106,36 +107,43 @@ final class VaultGrant: @unchecked Sendable {
   /// - `root`：主会话已认证的随机密钥；依赖父会话时不另行持有该密钥。
   /// - `vaultID`：该主密钥所属的保险箱。
   /// - `parent`：临时用途能力依赖的 App 会话；为空时是独立验证取得的主会话。
+  /// - `rootToken`：会话轮换时继承的当前 ROOT 激活身份，新解锁默认不启用。
   /// 返回：仅保存在内存中的会话能力。
-  init(root: Data, vaultID: UUID, parent: VaultGrant? = nil) {
+  init(root: Data, vaultID: UUID, parent: VaultGrant? = nil, rootToken: UUID? = nil) {
     self.root = parent == nil ? root : nil
     self.vaultID = vaultID
     self.parent = parent
+    rootActivation = rootToken
   }
 
   /// 业务作用：在线性化的授权范围内使用主密钥或交付明文，使撤销之后旧任务无法继续交付。
   /// 参数说明：
   /// - `folders`：本次交付需要保持有效的目录验证代次。
+  /// - `rootToken`：隐藏目录读取所绑定的 ROOT 激活身份；为空时不要求 ROOT。
   /// - `operation`：同步完成的受保护操作，不得再次进入同一能力。
   /// 返回：操作成功的结果；会话撤销后立即拒绝。
-  func access<T>(folders: [UUID: UUID] = [:], _ operation: (Data) throws -> T) throws -> T {
+  func access<T>(
+    folders: [UUID: UUID] = [:], rootToken: UUID? = nil, _ operation: (Data) throws -> T
+  ) throws -> T {
     if let parent {
-      // 临时复制能力每次交付都依赖原 App 会话；锁定父会话即可阻止下一块读写。
-      return try parent.access { root in
+      // 临时能力持续依赖原 App 会话及 ROOT 激活身份，关闭 ROOT 后不能继续读取隐藏内容。
+      return try parent.access(rootToken: rootToken) { root in
         try accessRoot(folders: folders, inheritedRoot: root, operation)
       }
     }
-    return try accessRoot(folders: folders, operation)
+    return try accessRoot(folders: folders, rootToken: rootToken, operation)
   }
 
   /// 业务作用：在当前能力自己的门禁内复验目录证明，并同步交付密钥或明文。
   /// 参数说明：
   /// - `folders`：本次操作必须仍有效的目录密码代次。
   /// - `inheritedRoot`：父会话在当前门禁内临时交付的密钥，不存入当前能力。
+  /// - `rootToken`：主会话必须仍持有的 ROOT 激活身份。
   /// - `operation`：不能重入当前能力的同步操作。
   /// 返回：当前能力和目录证明均有效时交付结果，否则在任何副作用之前拒绝。
   private func accessRoot<T>(
-    folders: [UUID: UUID], inheritedRoot: Data? = nil, _ operation: (Data) throws -> T
+    folders: [UUID: UUID], inheritedRoot: Data? = nil, rootToken: UUID? = nil,
+    _ operation: (Data) throws -> T
   ) throws -> T {
     mutex.lock()
     defer {
@@ -145,10 +153,44 @@ final class VaultGrant: @unchecked Sendable {
     guard active, let root = inheritedRoot ?? root else {
       throw VaultError.locked
     }
+    // 每次开启使用不同身份，关闭后重新验证也不能恢复先前读取器的权限。
+    if let rootToken, rootActivation != rootToken {
+      throw VaultError.rootRequired
+    }
     for (id, revision) in folders where folderAccess[id] != revision {
       throw VaultError.folderPasswordRequired(id)
     }
     return try operation(root)
+  }
+
+  /// 业务作用：取得当前 ROOT 激活身份，临时能力沿用父会话的实时状态。
+  /// 参数说明：无。
+  /// 返回：ROOT 已验证开启时返回内存身份，未开启时为空；会话撤销时拒绝。
+  func rootToken() throws -> UUID? {
+    if let parent {
+      return try parent.rootToken()
+    }
+    return try access { _ in
+      rootActivation
+    }
+  }
+
+  /// 业务作用：仅在存储层完成独立 ROOT 密码验证后发放本次激活身份。
+  /// 参数说明：无。
+  /// 返回：有效会话进入 ROOT 模式；新身份不能恢复此前已经撤销的读取器。
+  func activateRoot() throws {
+    try access { _ in
+      rootActivation = UUID()
+    }
+  }
+
+  /// 业务作用：无需再次验证密码立即撤销 ROOT 权限，不影响 App 的普通解锁状态。
+  /// 参数说明：无。
+  /// 返回：此后隐藏内容的交付与管理操作失权。
+  func deactivateRoot() {
+    mutex.lock()
+    rootActivation = nil
+    mutex.unlock()
   }
 
   /// 业务作用：检查当前会话仍有效，供有界读写循环在下一步副作用前复验。
@@ -192,6 +234,7 @@ final class VaultGrant: @unchecked Sendable {
     active = false
     root = nil
     folderAccess = [:]
+    rootActivation = nil
     mutex.unlock()
   }
 }

@@ -3,7 +3,7 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// 业务作用：以同一套矢量图形生成两端图标，保持小尺寸下保险箱轮廓可辨认。
+/// 业务作用：以青蓝至紫色渐变衬托两端统一的白色保险箱，小尺寸下保持轮廓可辨认。
 /// 参数说明：
 /// - `size`：目标像素边长。
 /// - `macOS`：是否保留 Mac 图标的透明外缘与圆角留白。
@@ -28,8 +28,8 @@ func render(size: Int, macOS: Bool) throws -> CGImage {
     context.clip()
   }
   let colors = [
-    CGColor(srgbRed: 0.21, green: 0.62, blue: 0.97, alpha: 1),
-    CGColor(srgbRed: 0.09, green: 0.27, blue: 0.68, alpha: 1),
+    CGColor(srgbRed: 0.33, green: 0.83, blue: 0.95, alpha: 1),
+    CGColor(srgbRed: 0.56, green: 0.43, blue: 0.96, alpha: 1),
   ]
   guard let gradient = CGGradient(colorsSpace: space, colors: colors as CFArray, locations: [0, 1])
   else {

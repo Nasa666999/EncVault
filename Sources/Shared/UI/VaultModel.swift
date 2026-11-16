@@ -60,7 +60,7 @@ final class VaultModel: ObservableObject {
 
   struct FolderPrompt: Identifiable, Sendable {
     enum Kind: Sendable {
-      case access, setting, removing, copy, move, rename
+      case access, setting, removing, copy, moveSource, move, rename
     }
     let id: UUID
     let challengeID = UUID()
@@ -71,6 +71,15 @@ final class VaultModel: ObservableObject {
   struct MoveSelection: Identifiable {
     let id = UUID()
     let media: [VaultMedia]
+  }
+
+  struct RootPrompt: Identifiable, Sendable {
+    enum Kind: Sendable {
+      case setting, unlocking, changing
+    }
+    let id: UUID
+    let challengeID = UUID()
+    let kind: Kind
   }
 
   private enum CopyDestination: Sendable {
@@ -130,6 +139,7 @@ final class VaultModel: ObservableObject {
     let message: String?
     var replacement: VaultGrant? = nil
     var moveFailure: String? = nil
+    var moveSourcePrompt = false
   }
 
   @Published var screen: Screen = .unavailable
@@ -147,12 +157,23 @@ final class VaultModel: ObservableObject {
     }
   }
   @Published var folderPrompt: FolderPrompt?
+  @Published private(set) var rootEnabled = false
+  @Published private(set) var rootPrompt: RootPrompt?
   @Published var movingMedia: MoveSelection?
   @Published private(set) var selecting = false
   @Published private(set) var selectedIDs: Set<UUID> = []
   @Published var moveFailure: String?
+  @Published private(set) var migration: VaultMigrationCoordinator?
+  struct MigrationCleanupPrompt: Identifiable {
+    let id = UUID()
+    let report: VaultMigrationStaging
+    let epoch: UInt64
+  }
+
+  @Published private(set) var migrationCleanup: MigrationCleanupPrompt?
   private var pendingFolderAction: FolderAction?
   private var pendingCopy: PendingCopy?
+  private var pendingMove: VaultMoveSession?
   @Published private var internalDrag: InternalDrag?
   @Published var busy = false {
     didSet {
@@ -167,7 +188,6 @@ final class VaultModel: ObservableObject {
   @Published private(set) var moving = false
   private var importProgressTask: Task<Void, Never>?
   @Published var message: String?
-  @Published var photoImportFailure: String?
   @Published var offer: EnrollmentOffer?
   @Published var selected: VaultMedia?
   @Published var image: VaultImage?
@@ -184,6 +204,8 @@ final class VaultModel: ObservableObject {
   @Published private(set) var credentialStatus: CredentialLockoutStatus?
   @Published var savedSources: [SavedImport] = []
   @Published var savedPhotos: [SavedPhotoImport] = []
+  private(set) var photoSourceRemovalInProgress = false
+  private var photoImportRetained: [String] = []
   private(set) var store: VaultStore?
   private var library: VaultLibrary?
   private var photos: PhotoVaultService?
@@ -197,12 +219,13 @@ final class VaultModel: ObservableObject {
   private var thumbnailGeneration: UInt64 = 0
   private var thumbnailFailures: [UUID: Data] = [:]
 
-  /// 业务作用：执行两端的切换锁定偏好，Mac 导入或移动期间仅临时豁免。
+  /// 业务作用：执行两端的切换锁定偏好，Mac 导入、移动或相册删源期间仅临时豁免。
   /// 参数说明：无。
   /// 返回：是否应在失去前台时锁定；iPhone 不因导入自动豁免，遵循用户验证后的偏好。
   var shouldLockWhenInactive: Bool {
     #if os(macOS)
       return VaultWindowPolicy.lockWhenInactive && !importing && !moving
+        && !photoSourceRemovalInProgress
     #else
       return VaultWindowPolicy.lockWhenInactive
     #endif
@@ -324,6 +347,22 @@ final class VaultModel: ObservableObject {
       }
     #endif
   }
+
+  /// 业务作用：相册删源结束立即恢复锁定策略，不让系统确认所需的临时豁免延续到任务之后。
+  /// 参数说明：无。
+  /// 返回：清除本次删源标记；Mac 已在后台且原策略开启时立即撤销会话。
+  private func finishPhotoSourceRemoval() {
+    guard photoSourceRemovalInProgress else {
+      return
+    }
+    photoSourceRemovalInProgress = false
+    #if os(macOS)
+      // 确认完成时可能仍由系统窗口占据前台，必须补执行原锁定策略，不能遗留后台解锁会话。
+      if VaultWindowPolicy.lockWhenInactive, !NSApplication.shared.isActive {
+        lock()
+      }
+    #endif
+  }
   #if os(iOS)
     private var foregroundProtection: VaultForegroundProtection?
   #endif
@@ -333,10 +372,10 @@ final class VaultModel: ObservableObject {
   /// 返回：文件夹在前、各组按原名排序的当前层级条目；文档包归入文件，根目录不混入子目录内容。
   var visibleItems: [VaultMedia] {
     items.filter {
-      $0.parentID == currentFolderID
+      $0.parentID == currentFolderID && (rootEnabled || !$0.isHidden)
     }.sorted {
-      let leftFolder = $0.isFolder && !$0.isDocument
-      let rightFolder = $1.isFolder && !$1.isDocument
+      let leftFolder = $0.isFolder && !$0.isFilePackage
+      let rightFolder = $1.isFolder && !$1.isFilePackage
       if leftFolder != rightFolder {
         return leftFolder
       }
@@ -346,6 +385,173 @@ final class VaultModel: ObservableObject {
       }
       return order == .orderedAscending
     }
+  }
+
+  /// 业务作用：开启 ROOT 前决定先设置独立密码还是验证已有密码，不借用其它凭据。
+  /// 参数说明：无。
+  /// 返回：当前已解锁且空闲时显示 ROOT 表单；未完成设置或验证前保持关闭。
+  func requestRootAccess() {
+    guard let store, let grant, screen == .library, !busy, !rootEnabled,
+      folderPrompt == nil, rootPrompt == nil, closeViewer()
+    else {
+      return
+    }
+    perform(
+      {
+        try store.hasRootPassword(using: grant)
+      },
+      success: { [weak self] configured in
+        self?.rootPrompt = RootPrompt(id: UUID(), kind: configured ? .unlocking : .setting)
+      })
+  }
+
+  /// 业务作用：只在 ROOT 已开启时提供独立 ROOT 改密入口，仍需重新验证原 ROOT 密码。
+  /// 参数说明：无。
+  /// 返回：当前空闲时显示原密码及新密码确认表单，不改动 App 或文件夹密码。
+  func requestRootPasswordChange() {
+    guard screen == .library, !busy, rootEnabled, rootPrompt == nil,
+      folderPrompt == nil, closeViewer()
+    else {
+      return
+    }
+    message = nil
+    rootPrompt = RootPrompt(id: UUID(), kind: .changing)
+  }
+
+  /// 业务作用：仅为当前 ROOT 表单设置或验证独立密码，设置完成仍须再验证才能开启。
+  /// 参数说明：
+  /// - `password`：本次输入的 ROOT 密码，仅在当前派生过程使用。
+  /// - `newPassword`：修改时已经重复确认的新 ROOT 密码；设置或开启时为空。
+  /// - `challengeID`：当前输入页面的身份，旧页面不能提交到后来的请求。
+  /// 返回：设置后进入验证页面；验证成功显示隐藏目录；错误、取消或失权时不开放 ROOT。
+  func submitRootPassword(_ password: String, newPassword: String? = nil, challengeID: UUID) {
+    guard let store, let library, let grant, let prompt = rootPrompt,
+      prompt.challengeID == challengeID, screen == .library, !busy,
+      prompt.kind == .changing ? rootEnabled : !rootEnabled
+    else {
+      return
+    }
+    perform(
+      {
+        () async throws -> [VaultMedia]? in
+        if prompt.kind == .changing {
+          guard let newPassword else {
+            throw VaultError.invalidRootPassword
+          }
+          try store.changeRootPassword(previous: password, password: newPassword, using: grant)
+          return nil
+        }
+        if prompt.kind == .setting {
+          try store.setRootPassword(password, using: grant)
+          return nil
+        }
+        try store.enableRoot(password: password, using: grant)
+        do {
+          return try library.list(using: grant)
+        } catch {
+          grant.deactivateRoot()
+          throw error
+        }
+      },
+      success: { [weak self] items in
+        guard let self, self.rootPrompt?.challengeID == prompt.challengeID else {
+          grant.deactivateRoot()
+          return
+        }
+        if prompt.kind == .changing {
+          self.rootPrompt = nil
+          self.disableRootAccess()
+          self.message = "ROOT 密码已更改，ROOT 权限已关闭，请使用新密码重新开启。"
+        } else if let items {
+          self.rootEnabled = true
+          self.items = items
+          self.rootPrompt = nil
+          self.message = "ROOT 权限已开启，隐藏文件夹以半透明图标显示。"
+        } else {
+          self.rootPrompt = RootPrompt(id: prompt.id, kind: .unlocking)
+          self.message = nil
+        }
+      })
+  }
+
+  /// 业务作用：取消尚未完成的 ROOT 密码设置、验证或修改，不改变当前模式。
+  /// 参数说明：无。
+  /// 返回：表单关闭；未完成验证不会开启 ROOT，取消修改时保留原密码与当前模式。
+  func cancelRootPrompt() {
+    guard !busy else {
+      return
+    }
+    rootPrompt = nil
+    message = nil
+  }
+
+  /// 业务作用：无需密码立即关闭 ROOT，离开隐藏目录并撤销隐藏内容的预览和读取。
+  /// 参数说明：无。
+  /// 返回：保留普通 App 解锁状态，隐藏目录及后代从列表消失；隐藏目录内返回最近可见上级。
+  func disableRootAccess() {
+    guard let grant, screen == .library, !busy || migration != nil, rootEnabled, closeViewer()
+    else {
+      return
+    }
+    // ROOT 是受限迁移的持续权威，先撤销迁移连接与候选能力，再关闭激活并刷新可见目录。
+    if migration != nil {
+      endMigration(refresh: false)
+    }
+    if let currentFolder,
+      let outermostHidden = path(for: currentFolder).last(where: {
+        $0.isHidden
+      })
+    {
+      currentFolderID = outermostHidden.parentID
+    }
+    // 先撤销 ROOT 交付权，再清空旧选择与缓存，重新开启不能恢复此前的读取器。
+    grant.deactivateRoot()
+    rootEnabled = false
+    rootPrompt = nil
+    folderPrompt = nil
+    pendingFolderAction = nil
+    movingMedia = nil
+    cancelMove()
+    cancelSystemCopy()
+    endSelection()
+    savedSources = []
+    savedPhotos = []
+    photoImportRetained = []
+    clearThumbnails()
+    message = nil
+    refresh()
+  }
+
+  /// 业务作用：在 ROOT 管理模式中设置或取消普通文件夹隐藏，不改变目录密码或内部文件。
+  /// 参数说明：
+  /// - `folder`：当前可见的普通文件夹，文件和文档包不接受此操作。
+  /// - `hidden`：目标隐藏状态。
+  /// 返回：成功后保持当前父目录并刷新样式；ROOT 关闭或发布失败时不更改可见性。
+  func setHidden(_ folder: VaultMedia, hidden: Bool) {
+    guard let library, let grant, rootEnabled, screen == .library, !busy,
+      folder.isFolder, !folder.isFilePackage, visibleItems.contains(folder), closeViewer()
+    else {
+      return
+    }
+    clearThumbnails()
+    perform(
+      {
+        let replacement = try library.setHidden(id: folder.id, hidden: hidden, using: grant)
+        do {
+          return (replacement, try library.list(using: replacement))
+        } catch {
+          replacement.revoke()
+          throw VaultError.organizationCommitUncertain
+        }
+      },
+      discard: { replacement, _ in
+        replacement.revoke()
+      },
+      success: { [weak self] replacement, items in
+        self?.grant = replacement
+        self?.items = items
+        self?.message = hidden ? "文件夹已设为隐藏。" : "已取消文件夹隐藏。"
+      })
   }
 
   /// 业务作用：只让同一目录内的图片和视频进入相册连续浏览，过滤普通文件及目录。
@@ -426,6 +632,76 @@ final class VaultModel: ObservableObject {
     return "/" + ancestors.reversed().map(\.originalFilename).joined(separator: "/")
   }
 
+  /// 业务作用：把当前可见条目的认证元数据转换为只读属性，不交付密码校验材料或密钥。
+  /// 参数说明：
+  /// - `media`：用户明确选择查看属性的文件或目录。
+  /// 返回：当前会话可见的属性；锁定或条目不可见时为空，不补造未保存的时间信息。
+  func properties(for media: VaultMedia) -> [(name: String, value: String)] {
+    guard screen == .library,
+      let current = items.first(where: {
+        $0.id == media.id
+      })
+    else {
+      return []
+    }
+    let ancestors = path(for: current)
+    guard
+      rootEnabled
+        || !ancestors.contains(where: {
+          $0.isHidden
+        })
+    else {
+      return []
+    }
+    let parentPath = ancestors.dropFirst().reversed().map(\.originalFilename).joined(separator: "/")
+    let protected = ancestors.filter {
+      $0.folderPassword != nil
+    }
+    var rows: [(name: String, value: String)] = [
+      ("名称", current.originalFilename),
+      ("种类", current.isFolder && current.isDocument ? "文档包" : current.kindTitle),
+      ("内容类型", current.photoAsset?.contentType ?? current.contentType),
+      ("所在目录", ancestors.isEmpty ? "无法读取" : "/" + parentPath),
+    ]
+    if let asset = current.photoAsset {
+      rows.append(
+        (
+          "大小",
+          "\(asset.byteCount.formatted(.byteCount(style: .file)))（\(asset.byteCount.formatted()) 字节）"
+        ))
+      rows.append(("SHA-256", asset.sha256.map { String(format: "%02x", $0) }.joined()))
+      rows.append(
+        (
+          "完整资源大小",
+          "\(asset.totalByteCount.formatted(.byteCount(style: .file)))（\(asset.totalByteCount.formatted()) 字节）"
+        ))
+      rows.append(("原始资源数量", asset.resourceCount.formatted()))
+    } else if current.isFolder {
+      rows.append(("大小", "目录条目，不包含子项大小"))
+    } else {
+      let size = current.byteCount.formatted(.byteCount(style: .file))
+      rows.append(("大小", "\(size)（\(current.byteCount.formatted()) 字节）"))
+      rows.append(
+        (
+          "SHA-256",
+          current.sha256.map {
+            String(format: "%02x", $0)
+          }.joined()
+        ))
+    }
+    rows.append(("文件标识", current.id.uuidString))
+    rows.append(("父目录标识", current.parentID?.uuidString ?? "保险箱根目录"))
+    rows.append(("自身密码保护", current.folderPassword == nil ? "未设置" : "已设置"))
+    if current.isFolder && !current.isFilePackage {
+      rows.append(("隐藏状态", current.isHidden ? "已隐藏，仅 ROOT 模式可见" : "未隐藏"))
+    }
+    rows.append(("所在路径密码保护", protected.isEmpty ? "无" : "受文件夹密码保护"))
+    if !protected.isEmpty {
+      rows.append(("保护目录", protected.reversed().map(\.originalFilename).joined(separator: " / ")))
+    }
+    return rows
+  }
+
   /// 业务作用：阻止菜单向受密码保护的来源目录树开放删除或移动。
   /// 参数说明：
   /// - `media`：用户当前选中的来源。
@@ -458,26 +734,32 @@ final class VaultModel: ObservableObject {
       || containsProtectedFolder(media)
   }
 
-  /// 业务作用：提供符合层级和保护范围限制的移动目标，提交时仍复验同名冲突。
+  /// 业务作用：提供符合层级和目录保护限制的移动目标，受保护文件验证来源密码后可移出原目录。
   /// 参数说明：
   /// - `media`：当前准备移动的条目。
   /// 返回：当前可见的目标目录身份及路径，根目录用空身份表示；受保护目标仍需独立验证。
   func moveDestinations(for media: VaultMedia) -> [(id: UUID?, title: String)] {
-    let sourceProtection = Set(
-      path(for: media).dropFirst().filter {
-        $0.folderPassword != nil
-      }.map(\.id))
+    let sourceProtection =
+      media.isFolder && !media.isFilePackage
+      ? Set(
+        path(for: media).dropFirst().filter {
+          $0.folderPassword != nil
+        }.map(\.id)) : []
     var result: [(id: UUID?, title: String)] = []
     if media.parentID != nil && sourceProtection.isEmpty {
       result.append((nil, "保险箱根目录"))
     }
     for folder in items.filter({
-      $0.isFolder && !$0.isDocument
+      $0.isFolder && !$0.isFilePackage
     }).sorted(by: {
       $0.originalFilename.localizedStandardCompare($1.originalFilename) == .orderedAscending
     }) {
       let ancestors = path(for: folder)
       guard folder.id != media.parentID, !ancestors.isEmpty,
+        rootEnabled
+          || !ancestors.contains(where: {
+            $0.isHidden
+          }),
         !ancestors.contains(where: {
           $0.id == media.id
         }),
@@ -508,11 +790,11 @@ final class VaultModel: ObservableObject {
     return !media.isEmpty && !media.contains(where: containsProtectedFolder)
   }
 
-  /// 业务作用：只向不含密码保护目录树的整批选择开放删除，不能用多选绕过单项限制。
+  /// 业务作用：仅向路径及子树均无密码保护的整批选择开放删除，不能用多选绕过单项限制。
   /// 参数说明：无。
-  /// 返回：当前非空选择中全部目录已取消保护时为真，执行时仍由存储层预检整批。
+  /// 返回：当前非空选择中全部来源均不受目录保护时为真，执行时仍由存储层预检整批。
   var canDeleteSelection: Bool {
-    !selectedItems.isEmpty && !selectedItems.contains(where: containsProtectedFolder)
+    !selectedItems.isEmpty && !selectedItems.contains(where: exportRestricted)
   }
 
   /// 业务作用：进入只用于批量整理的选择模式，关闭旧拖放身份。
@@ -601,12 +883,12 @@ final class VaultModel: ObservableObject {
   /// 参数说明：
   /// - `media`：选中的文件或无密码目录树。
   /// - `parentID`：用户明确选择的接收目录。
-  /// 返回：需要目标密码时呈现验证，否则执行移动；始终不解密导出到系统。
+  /// 返回：先重新验证受保护来源，再验证必要的目标密码；始终不解密导出到系统。
   func move(_ media: VaultMedia, to parentID: UUID?) {
     move([media], to: parentID)
   }
 
-  /// 业务作用：对同一批明确来源开启统一目标移动，目标密码只在本次批次验证。
+  /// 业务作用：对同一批明确来源开启统一目标移动，来源保护密码在本次批次重新验证。
   /// 参数说明：
   /// - `media`：本次选定的文件与普通目录。
   /// - `parentID`：全部项目共用的接收目录。
@@ -615,13 +897,10 @@ final class VaultModel: ObservableObject {
     guard !media.isEmpty, !busy, screen == .library, folderPrompt == nil else {
       return
     }
-    moveFailure = nil
-    // 每次移动只保留当前浏览路径的证明，不能复用此前其它目标的密码授权。
-    grant?.retainFolderAccess(currentFolderPathIDs)
-    runFolderAction(.move(media, parentID))
+    startMove(.move(media, parentID))
   }
 
-  /// 业务作用：判断来源能否移到其父目录的上一级，保护范围不得被越过。
+  /// 业务作用：判断来源能否移到其父目录的上一级，文件允许在独立验证后离开保护范围。
   /// 参数说明：
   /// - `media`：位于保险箱子目录中的来源。
   /// 返回：父层存在且上一级满足现有移动约束时为真。
@@ -677,10 +956,35 @@ final class VaultModel: ObservableObject {
     guard !media.isEmpty, !busy, screen == .library, folderPrompt == nil else {
       return
     }
+    startMove(.movePath(media, path))
+  }
+
+  /// 业务作用：为菜单、路径输入与拖放建立相同的单次来源验证边界。
+  /// 参数说明：
+  /// - `action`：已明确来源及目标选择的移动动作。
+  /// 返回：建立空证明后开始预检；失败只显示原因，不影响浏览目录或文件位置。
+  private func startMove(_ action: FolderAction) {
+    guard let library, let grant else {
+      return
+    }
     moveFailure = nil
-    // 指定路径与拖放采用同一新验证边界，不继承旧目标的临时访问权。
-    grant?.retainFolderAccess(currentFolderPathIDs)
-    runFolderAction(.movePath(media, path))
+    cancelMove()
+    do {
+      pendingMove = try library.beginMove(ids: action.sources.map(\.id), using: grant)
+      // 浏览路径授权保留以支持取消；来源密码由独立移动证明重新验证，旧目标权限不继承。
+      grant.retainFolderAccess(currentFolderPathIDs)
+      runFolderAction(action)
+    } catch {
+      moveFailure = Self.message(error)
+    }
+  }
+
+  /// 业务作用：撤销已结束或取消移动的来源密码证明，不影响当前目录浏览。
+  /// 参数说明：无。
+  /// 返回：下一次移动必须重新验证相关来源密码。
+  private func cancelMove() {
+    pendingMove?.revoke()
+    pendingMove = nil
   }
 
   /// 业务作用：仅允许从当前目录拖动普通文件或不含密码保护的目录树。
@@ -723,7 +1027,7 @@ final class VaultModel: ObservableObject {
   func canDrop(into folder: VaultMedia) -> Bool {
     guard let request = internalDrag, request.parentID == currentFolderID,
       let source = visibleItems.first(where: { $0.id == request.mediaID }), canDrag(source),
-      visibleItems.contains(folder), folder.isFolder, !folder.isDocument,
+      visibleItems.contains(folder), folder.isFolder, !folder.isFilePackage,
       moveDestinations(for: source).contains(where: { $0.id == folder.id })
     else {
       return false
@@ -735,7 +1039,7 @@ final class VaultModel: ObservableObject {
     }
   }
 
-  /// 业务作用：松手后消费当前拖放令牌，再通过统一移动流程验证目标密码。
+  /// 业务作用：松手后消费当前拖放令牌，再通过统一移动流程验证来源与目标密码。
   /// 参数说明：
   /// - `data`：本进程拖放提供者交付的随机令牌。
   /// - `folderID`：松手时明确选择的目标目录身份。
@@ -758,7 +1062,7 @@ final class VaultModel: ObservableObject {
   /// - `removing`：是否需要凭原密码取消已有保护。
   /// 返回：只打开当前目录的表单，不立即更改保护状态。
   func requestFolderPassword(_ folder: VaultMedia, removing: Bool) {
-    guard screen == .library, !busy, folder.isFolder, !folder.isDocument,
+    guard screen == .library, !busy, folder.isFolder, !folder.isFilePackage,
       visibleItems.contains(folder)
     else {
       return
@@ -803,6 +1107,26 @@ final class VaultModel: ObservableObject {
             return
           }
           self.continueSystemCopy(request)
+        })
+      return
+    }
+    if prompt.kind == .moveSource {
+      guard let session = pendingMove else {
+        return
+      }
+      perform(
+        {
+          try library.authenticateMoveFolder(
+            id: prompt.folder.id, password: password, session: session, using: grant)
+        },
+        success: { [weak self] in
+          guard let self, self.folderPrompt?.challengeID == prompt.challengeID,
+            self.pendingMove === session, let action = self.pendingFolderAction
+          else {
+            session.revoke()
+            return
+          }
+          self.runFolderAction(action)
         })
       return
     }
@@ -863,6 +1187,7 @@ final class VaultModel: ObservableObject {
     folderPrompt = nil
     pendingFolderAction = nil
     cancelSystemCopy()
+    cancelMove()
     grant?.retainFolderAccess(currentFolderPathIDs)
     if cancelled {
       clearThumbnails()
@@ -870,10 +1195,10 @@ final class VaultModel: ObservableObject {
     }
   }
 
-  /// 业务作用：访问或移入目标目录前验证密码，导出与删除直接执行目录保护限制。
+  /// 业务作用：访问及移动前验证对应目录密码，移动来源单独验证，导出与删除执行保护限制。
   /// 参数说明：
   /// - `action`：用户明确选择且已完成外层确认的目录或文件操作。
-  /// 返回：访问或移入目标需要密码时等待验证；移动后撤销旧层级能力，失败不放开保护。
+  /// 返回：来源或目标缺少证明时等待验证；移动后撤销旧层级能力，失败不放开保护。
   private func runFolderAction(_ action: FolderAction) {
     guard let library, let grant, !busy, screen == .library else {
       return
@@ -888,10 +1213,20 @@ final class VaultModel: ObservableObject {
     cancelSystemCopy()
     pendingFolderAction = action
     let previousFolderID = currentFolderID
+    let moveSession = pendingMove
     moving = action.isMove
     perform(
       {
         var moveParentID: UUID?
+        if action.isMove {
+          guard let moveSession else {
+            throw VaultError.invalidMove
+          }
+          if let locked = try library.nextMoveFolder(moveSession, using: grant) {
+            return FolderActionResult(
+              prompt: locked, folderID: nil, items: [], message: nil, moveSourcePrompt: true)
+          }
+        }
         // 删除和导出不能把访问密码当作取消保护；移入受保护目标则必须先取得该目录访问权。
         switch action {
         case .delete, .export:
@@ -933,7 +1268,8 @@ final class VaultModel: ObservableObject {
           notice = "已按原名导出到系统，保险箱内原件保留。系统中的副本不再受保险箱密码保护。"
         case .move, .movePath:
           let result = try library.move(
-            ids: action.sources.map(\.id), to: moveParentID, using: grant)
+            ids: action.sources.map(\.id), to: moveParentID,
+            authorization: moveSession, using: grant)
           let replacement = result.grant
           do {
             let notice = result.failure.map {
@@ -950,7 +1286,7 @@ final class VaultModel: ObservableObject {
             throw VaultError.organizationCommitUncertain
           }
         case .rename(let media, let name):
-          let ordinaryFolder = media.isFolder && !media.isDocument
+          let ordinaryFolder = media.isFolder && !media.isFilePackage
           let replacement: VaultGrant
           if ordinaryFolder {
             replacement = try library.renameFolder(id: media.id, to: name, using: grant)
@@ -989,7 +1325,7 @@ final class VaultModel: ObservableObject {
           let kind: FolderPrompt.Kind
           switch action {
           case .move, .movePath:
-            kind = .move
+            kind = result.moveSourcePrompt ? .moveSource : .move
           case .rename:
             kind = .rename
           default:
@@ -1002,6 +1338,7 @@ final class VaultModel: ObservableObject {
         self.items = result.items
         if action.isMove {
           self.endSelection()
+          self.cancelMove()
         }
         self.currentFolderID = result.folderID
         self.grant?.retainFolderAccess(self.currentFolderPathIDs)
@@ -1098,6 +1435,9 @@ final class VaultModel: ObservableObject {
         if case VaultError.organizationCommitUncertain = error {
           self.lock()
         }
+        if case VaultError.rootCommitUncertain = error {
+          self.lock()
+        }
         if self.pendingFolderAction?.isMove == true {
           switch error {
           case VaultError.invalidFolderPassword, VaultError.incorrectFolderPassword:
@@ -1113,6 +1453,7 @@ final class VaultModel: ObservableObject {
         if self.folderPrompt == nil {
           self.pendingFolderAction = nil
           self.cancelSystemCopy()
+          self.cancelMove()
         }
         if case VaultError.credentialCommitUncertain = error {
           self.lock()
@@ -1129,6 +1470,7 @@ final class VaultModel: ObservableObject {
         }
         self.finishImport()
         self.finishMoving()
+        self.finishPhotoSourceRemoval()
         self.busy = false
         self.operation = nil
         if case VaultError.wait = error {
@@ -1137,6 +1479,9 @@ final class VaultModel: ObservableObject {
         }
         self.refreshCredentialStatus()
         self.message = Self.message(error)
+        if let prompt = self.rootPrompt {
+          self.rootPrompt = RootPrompt(id: prompt.id, kind: prompt.kind)
+        }
         if let prompt = self.folderPrompt {
           switch error {
           case VaultError.invalidFolderPassword, VaultError.incorrectFolderPassword:
@@ -1174,6 +1519,8 @@ final class VaultModel: ObservableObject {
       },
       success: { [weak self] grant, items in
         self?.grant = grant
+        self?.rootEnabled = false
+        self?.rootPrompt = nil
         self?.items = items
         self?.screen = .library
         self?.refreshCredentialStatus()
@@ -1253,6 +1600,8 @@ final class VaultModel: ObservableObject {
       success: { [weak self] grant, kind in
         self?.offer = nil
         self?.grant = grant
+        self?.rootEnabled = false
+        self?.rootPrompt = nil
         self?.items = []
         self?.kind = kind
         self?.refreshCredentialStatus()
@@ -1301,16 +1650,18 @@ final class VaultModel: ObservableObject {
     }
   }
 
-  /// 业务作用：串行保存所选文件或完整目录，完整成功后只保留普通文件的当前会话删源收据。
+  /// 业务作用：在当前已授权目录串行保存所选文件或完整目录，完整成功后保留当前会话删源收据。
   /// 参数说明：
   /// - `urls`：系统明确授权的本地文件、文件包或目录。
-  /// 返回：保存进度和成功收据留在内存；保留目录层级，失败及未完成的来源不移除。
+  /// 返回：保留当前浏览目录及来源层级，复用已有目录权限；失败及未完成的来源不移除。
   func importFiles(_ urls: [URL]) {
     guard let library, let grant, !urls.isEmpty, !busy, screen == .library, closeViewer() else {
       return
     }
+    let parentID = currentFolderID
     savedSources = []
     savedPhotos = []
+    photoImportRetained = []
     progress = 0
     let buffer = beginImport()
     perform(
@@ -1338,12 +1689,14 @@ final class VaultModel: ObservableObject {
                   files: previousFiles, bytes: previousBytes, failures: previousFailures))
             }
             if try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
-              let result = try library.saveFolder(source: url, using: grant, status: report)
+              let result = try library.saveFolder(
+                source: url, in: parentID, using: grant, status: report)
               saved.append(contentsOf: result.saved)
               completedBytes += result.saved.reduce(0) { $0 + $1.media.byteCount }
               failures += result.failures
             } else {
-              let receipt = try library.save(source: url, using: grant, status: report)
+              let receipt = try library.save(
+                source: url, in: parentID, using: grant, status: report)
               saved.append(receipt)
               completedBytes += receipt.media.byteCount
             }
@@ -1359,7 +1712,6 @@ final class VaultModel: ObservableObject {
       },
       success: { [weak self] saved, items, failures in
         self?.items = items
-        self?.currentFolderID = nil
         self?.savedSources = saved
         self?.progress = 1
         if failures > 0 {
@@ -1368,124 +1720,136 @@ final class VaultModel: ObservableObject {
       })
   }
 
-  /// 业务作用：保存系统选择器交付的所选文件，不枚举图库，也不把资产身份当作文件内容。
+  /// 业务作用：将系统选择器交付的文件保存到当前已授权目录，不枚举图库或重复验证目录密码。
   /// 参数说明：
   /// - `selections`：本次明确勾选、由系统选择器交付的照片或视频。
-  /// 返回：成功文件进入原名列表，只有完整成功的资产获得可选删源收据。
+  /// 返回：已交付文件进入列表，删源前补齐并复验原件；导入结果只在底部状态区展示。
   func importPhotos(_ selections: [PhotosPickerItem]) {
     guard let photos, let library, let grant, !selections.isEmpty, !busy,
       screen == .library, closeViewer()
     else {
       return
     }
+    let parentID = currentFolderID
     savedPhotos = []
     savedSources = []
-    photoImportFailure = nil
+    photoImportRetained = []
     progress = 0
     let buffer = beginImport()
     perform(
       {
+        #if os(macOS)
+          if selections.contains(where: { $0.itemIdentifier != nil }) {
+            await photos.prepareImportAccess()
+            try grant.check()
+          }
+        #endif
         var saved: [SavedPhotoImport] = []
         var savedCount = 0
         var completedBytes: UInt64 = 0
         var failures: [String] = []
-        for selection in selections {
+        for (index, selection) in selections.enumerated() {
+          var name = "第 \(index + 1) 项"
           do {
             buffer.publish(
               ImportProgress(
                 phase: .directory, filename: "正在接收所选照片或视频", currentBytes: 0, totalBytes: 0,
                 completedFiles: savedCount, completedBytes: completedBytes,
                 failedFiles: failures.count))
-            guard let picked = try await selection.loadTransferable(type: PickedPhotoFile.self)
-            else {
-              throw VaultError.photoResource
-            }
-            defer {
-              try? FileManager.default.removeItem(at: picked.directory)
-            }
             try grant.check()
             let previousCount = savedCount
             let previousBytes = completedBytes
             let previousFailures = failures.count
-            let result = try photos.savePickedFile(
-              picked.file, identifier: selection.itemIdentifier, using: grant,
+            let result = try await photos.saveSelection(
+              identifier: selection.itemIdentifier, in: parentID, using: grant,
+              receive: {
+                guard let picked = try await selection.loadTransferable(type: PickedPhotoFile.self)
+                else {
+                  throw VaultError.photoResource
+                }
+                return picked
+              },
               progress: { update in
                 buffer.publish(
                   update.adding(
                     files: previousCount, bytes: previousBytes, failures: previousFailures))
               })
+            name = result.media.originalFilename
             savedCount += 1
-            completedBytes += result.media.byteCount
-            if let receipt = result.receipt {
-              saved.append(receipt)
-            }
+            completedBytes += result.byteCount
+            saved.append(result)
           } catch {
             try grant.check()
             if Task.isCancelled {
               throw VaultError.cancelled
             }
-            failures.append(Self.message(error))
+            failures.append("\(name)：\(Self.message(error))")
           }
         }
         return (saved, savedCount, try library.list(using: grant), failures)
       },
       success: { [weak self] saved, savedCount, items, failures in
         self?.savedPhotos = saved
+        self?.photoImportRetained = failures
         self?.items = items
         if !failures.isEmpty {
           let reasons = Array(Set(failures)).sorted().joined(separator: "\n")
-          let message = "已保存 \(savedCount) 项，\(failures.count) 项未能导入。\n\(reasons)\n未导入的原件已保留。"
+          let message = "已保存所选 \(savedCount) 项，\(failures.count) 项未能保存。\n\(reasons)\n未完成的原件已保留。"
           self?.message = message
-          if savedCount == 0 {
-            // 全部失败时必须明确反馈原因，不能只关闭选择器并在空相册底部留下难以发现的提示。
-            self?.photoImportFailure = message
-          }
-        } else if savedCount > 0 && saved.count < savedCount {
-          self?.message = "已加密保存所选文件；请通过系统照片管理无法复验的原件。"
+        } else if saved.contains(where: { $0.retentionReason != nil }) {
+          self?.message = "已加密保存所选 \(savedCount) 项。删除相册原件前会申请必要权限，并补齐、复验全部配套资源。"
         }
       })
   }
 
-  /// 业务作用：仅处理用户刚确认的成功保存收据，逐一复验后请求系统移除来源。
+  /// 业务作用：复验用户确认的全部来源，系统照片合并为一次删除事务并逐项说明保留原因。
   /// 参数说明：无。
-  /// 返回：成功或部分失败的数量提示；加密文件不因此删除。
+  /// 返回：底部状态区展示删除数量、未删除数量及原因，不弹结果窗口；未完整保存的资产不删除。
   func removeSavedSources() {
-    guard let library, let grant, !savedSources.isEmpty || !savedPhotos.isEmpty else {
+    guard let library, let grant, !busy, screen == .library,
+      !savedSources.isEmpty || !savedPhotos.isEmpty
+    else {
       return
     }
     let receipts = savedSources
     let photoReceipts = savedPhotos
+    let importRetained = photoImportRetained
     let photos = photos
     savedSources = []
     savedPhotos = []
+    photoImportRetained = []
+    // 系统删除确认只造成暂时失焦；真正进入后台仍撤销会话和未提交动作。
+    photoSourceRemovalInProgress = !photoReceipts.isEmpty
     perform(
       {
         var removed = 0
+        // 未完整导入的选择仍计入最终结果，不能被成功保存项目的删源提示覆盖。
+        var retained = importRetained
         for receipt in receipts {
           do {
             try library.removeSource(receipt, using: grant)
             removed += 1
           } catch {
             try grant.check()
+            retained.append("\(receipt.media.originalFilename)：\(Self.message(error))")
           }
         }
         if let photos {
-          for receipt in photoReceipts {
-            do {
-              try await photos.removeSource(receipt, using: grant)
-              removed += 1
-            } catch {
-              try grant.check()
-            }
-          }
+          let result = try await photos.removeSources(photoReceipts, using: grant)
+          removed += result.removed
+          retained += result.retained
+        } else {
+          retained += photoReceipts.map { "\($0.media.originalFilename)：相册服务不可用，原件保留。" }
         }
-        return removed
+        return (removed, retained, try library.list(using: grant))
       },
-      success: { [weak self] removed in
-        self?.message =
-          removed == receipts.count + photoReceipts.count
-          ? "已请求系统移除原件。加密文件保留在保险箱中。"
-          : "加密文件已保存；部分原件未能移除，请通过系统检查。"
+      success: { [weak self] removed, retained, items in
+        self?.items = items
+        let total = receipts.count + photoReceipts.count + importRetained.count
+        let summary = "共 \(total) 项：已删除 \(removed) 项，未确认删除 \(retained.count) 项。保险箱内的加密文件保留。"
+        let detail = retained.isEmpty ? "" : "\n\n未删除项目：\n" + retained.joined(separator: "\n")
+        self?.message = summary + detail
+        self?.finishPhotoSourceRemoval()
       })
   }
 
@@ -1534,7 +1898,7 @@ final class VaultModel: ObservableObject {
   /// - `name`：用户手动确认的新名称。
   /// 返回：未验证时打开密码表单，成功后回根目录并刷新名称，不改变密码或子项。
   func renameFolder(_ folder: VaultMedia, to name: String) {
-    guard screen == .library, !busy, folder.isFolder, !folder.isDocument,
+    guard screen == .library, !busy, folder.isFolder, !folder.isFilePackage,
       visibleItems.contains(folder)
     else {
       return
@@ -1549,7 +1913,7 @@ final class VaultModel: ObservableObject {
   /// 返回：编辑未退出时不执行；需要所属目录密码时先验证，成功后回根目录刷新名称并撤销旧读取。
   func renameFile(_ media: VaultMedia, to name: String) {
     // 改名会关闭查看并轮换会话，不能借此丢弃尚未由用户保存或确认退出的草稿。
-    guard screen == .library, !busy, editingText == nil, !media.isFolder || media.isDocument,
+    guard screen == .library, !busy, editingText == nil, !media.isFolder || media.isFilePackage,
       visibleItems.contains(media)
     else {
       return
@@ -1744,7 +2108,7 @@ final class VaultModel: ObservableObject {
       return
     }
     closeViewer()
-    if media.isFolder && !media.isDocument {
+    if media.isFolder && !media.isFilePackage {
       runFolderAction(.enter(media))
       return
     }
@@ -1758,7 +2122,7 @@ final class VaultModel: ObservableObject {
     }
     perform(
       {
-        let reader = try library.reader(id: media.id, using: grant)
+        let reader = try library.presentationReader(id: media.id, using: grant)
         return (reader, media.isVideo ? nil : try await MediaImageDecoder.render(reader))
       },
       success: { [weak self] reader, bitmap in
@@ -1982,7 +2346,8 @@ final class VaultModel: ObservableObject {
         let entries = self.items
         let worker = Task.detached(priority: .utility) {
           if media.isImage || media.isVideo {
-            return try await MediaThumbnail.render(library.reader(id: media.id, using: grant))
+            return try await MediaThumbnail.render(
+              library.presentationReader(id: media.id, using: grant))
           }
           return try DocumentThumbnail.render(
             media, entries: entries, library: library, using: grant)
@@ -2046,6 +2411,10 @@ final class VaultModel: ObservableObject {
   /// 参数说明：无。
   /// 返回：后续必须重新验证独立密码，不恢复上次选择和进度。
   func lock() {
+    migration?.cancel()
+    migration = nil
+    migrationCleanup = nil
+    photoSourceRemovalInProgress = false
     automaticLockRequest = nil
     importing = false
     moving = false
@@ -2057,7 +2426,10 @@ final class VaultModel: ObservableObject {
     operation = nil
     // 撤销先于界面清空，后台任务不能趁界面切换继续交付明文或删源。
     store?.lock()
+    rootEnabled = false
+    rootPrompt = nil
     cancelSystemCopy()
+    cancelMove()
     grant = nil
     folderPrompt = nil
     movingMedia = nil
@@ -2079,12 +2451,106 @@ final class VaultModel: ObservableObject {
     } else if screen != .unavailable {
       message = nil
     }
-    photoImportFailure = nil
+    photoImportRetained = []
     if screen == .library {
       screen = .locked
     }
     if screen == .locked {
       refreshCredentialStatus()
+    }
+  }
+
+  /// 业务作用：从明确选择或当前目录进入跨设备密文迁移，不开放系统明文导出。
+  /// 参数说明：
+  /// - `role`：当前设备发送或接收。
+  /// - `media`：明确选择的来源；为空时发送当前目录本身或全部根项目。
+  /// 返回：独立迁移页面持有当前会话，业务范围与 ROOT 门禁由底层再次核对。
+  func beginMigration(_ role: VaultMigrationRole, media: [VaultMedia]? = nil) {
+    guard screen == .library, !busy, migration == nil, editingText == nil,
+      let library, let grant, closeViewer()
+    else {
+      return
+    }
+    let ids = media?.map(\.id) ?? (currentFolderID.map { [$0] } ?? [])
+    if role == .send, let media, media.isEmpty {
+      return
+    }
+    endSelection()
+    message = nil
+    busy = true
+    migration = VaultMigrationCoordinator(
+      role: role, library: library, grant: grant, parentID: currentFolderID, sourceIDs: ids)
+  }
+
+  /// 业务作用：准备未入库接收的清理快照，让用户先核对占用量与续传影响。
+  /// 参数说明：无。
+  /// 返回：只统计空闲接收任务；没有暂存时在底部说明，不触及来源与正式媒体。
+  func requestMigrationCleanup() {
+    guard let library, let grant, screen == .library, !busy, migration == nil else {
+      return
+    }
+    perform(
+      {
+        try library.incomingMigrationStaging(using: grant)
+      },
+      success: { [weak self] report in
+        if report.taskIDs.isEmpty {
+          self?.message = "没有需要清理的未完成接收暂存。"
+        } else {
+          if let self {
+            self.migrationCleanup = MigrationCleanupPrompt(report: report, epoch: self.epoch)
+          }
+        }
+      })
+  }
+
+  /// 业务作用：撤下本次暂存清理确认，不保留可在下次会话直接使用的删除意图。
+  /// 参数说明：无。
+  /// 返回：全部密文和续传任务保持不变。
+  func cancelMigrationCleanup() {
+    migrationCleanup = nil
+  }
+
+  /// 业务作用：消费用户确认的任务快照，只删除该批未入库接收候选并刷新占用状态。
+  /// 参数说明：
+  /// - `prompt`：用户刚确认的固定任务范围及所属解锁代次。
+  /// 返回：底部显示实际清理量；活动任务或锁定时拒绝，不删除已入库内容。
+  func clearIncomingMigrationStaging(_ prompt: MigrationCleanupPrompt) {
+    guard let library, let grant, screen == .library, prompt.epoch == epoch,
+      !busy, migration == nil
+    else {
+      return
+    }
+    let report = prompt.report
+    migrationCleanup = nil
+    perform(
+      {
+        try library.discardIncomingMigrations(report.taskIDs, using: grant)
+      },
+      success: { [weak self] result in
+        let size = ByteCountFormatter.string(
+          fromByteCount: Int64(clamping: result.byteCount), countStyle: .file)
+        self?.message = "已清理 \(result.taskIDs.count) 批未入库接收暂存，释放约 \(size)。来源文件和已入库内容保留。"
+      })
+  }
+
+  /// 业务作用：关闭迁移时撤销网络与用途能力，已提交副本从正常列表重新枚举。
+  /// 参数说明：
+  /// - `refresh`：普通关闭重新枚举；随后的 ROOT 切换自行刷新时为空操作。
+  /// 返回：不自动删除源文件，不允许旧页面继续提交；状态不明时要求重新解锁。
+  func endMigration(refresh: Bool = true) {
+    guard let migration else {
+      return
+    }
+    let relock = migration.requiresRelock
+    migration.cancel()
+    self.migration = nil
+    busy = false
+    if relock {
+      lock()
+      message = VaultMigrationError.recovery.errorDescription
+    } else if refresh, screen == .library {
+      self.refresh()
     }
   }
 

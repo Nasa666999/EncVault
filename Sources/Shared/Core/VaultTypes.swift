@@ -182,6 +182,10 @@ enum VaultError: Error, LocalizedError, Sendable {
   case credentialCommitUncertain
   case photoAccess
   case photoResource
+  case photoSelectionDelivery(Int)
+  case photoResourceUnavailable(String, Int)
+  case photoResourcePending
+  case incompletePhotoBundle
   case photoLocalResource
   case invalidFolder
   case unsupportedSource
@@ -210,12 +214,30 @@ enum VaultError: Error, LocalizedError, Sendable {
   case moveDirectoryNotFound
   case organizationCommitUncertain
   case folderCommitUncertain
+  case rootRequired
+  case rootNotConfigured
+  case rootAlreadyConfigured
+  case invalidRootPassword
+  case incorrectRootPassword
+  case rootCommitUncertain
 
   /// 业务作用：为界面提供脱敏失败说明，不泄露路径、密钥和媒体正文。
   /// 参数说明：无。
   /// 返回：对应失败边界的本地提示。
   var errorDescription: String? {
     switch self {
+    case .rootRequired:
+      return "请先验证 ROOT 密码并开启 ROOT 权限。"
+    case .rootNotConfigured:
+      return "请先设置独立的 ROOT 密码。"
+    case .rootAlreadyConfigured:
+      return "ROOT 密码已经设置，请使用 ROOT 密码验证开启。"
+    case .invalidRootPassword:
+      return "ROOT 密码需为 6 至 128 个字符，不能全部为空白。"
+    case .incorrectRootPassword:
+      return "ROOT 密码校验未通过。"
+    case .rootCommitUncertain:
+      return "ROOT 密码保存状态未能确认，请重新解锁后再验证；不要清空保险箱。"
     case .invalidPIN:
       return "请输入完整的 6 位数字密码。"
     case .invalidPattern:
@@ -258,6 +280,14 @@ enum VaultError: Error, LocalizedError, Sendable {
       return "无法访问所选照片。请在系统设置中允许照片访问，返回后重新解锁操作。"
     case .photoResource:
       return "系统未能交付所选文件，请重新选择，或通过本地文件入口导入；原件已保留。"
+    case .photoSelectionDelivery(let code):
+      return "系统照片选择器未能交付此项目（错误 \(code)）；请重新选择，原件保留。"
+    case .photoResourceUnavailable(let role, let code):
+      return "\(role)暂时无法读取（系统错误 \(code)）；已交付的文件仍可保存，原件保留。"
+    case .photoResourcePending:
+      return "系统仍在处理照片原件，目前只有代理图；可保存所选副本，原件处理完成前不能删源。"
+    case .incompletePhotoBundle:
+      return "配套资源未能全部保存并确认，原件保留；已交付的文件仍可单独保存。"
     case .photoLocalResource:
       return "系统未能提供可离线读取的照片或视频原件。请重新选择，或通过本地文件入口导入；原件已保留。"
     case .invalidFolder:
@@ -265,7 +295,7 @@ enum VaultError: Error, LocalizedError, Sendable {
     case .unsupportedSource:
       return "来源不是可读取的普通文件或目录，符号链接和特殊文件不会被导入。"
     case .compositePhoto:
-      return "暂不处理 Live Photo、RAW 组合或含多个资源的编辑照片，原件保留。"
+      return "此相册操作要求单一照片或视频资源；组合资源请按完整文件夹保存或导出，原件保留。"
     case .photoChange:
       return "系统未能确认相册操作完成，请检查系统照片；保险箱内的加密文件保留。"
     case .systemExportUncertain:
@@ -291,11 +321,11 @@ enum VaultError: Error, LocalizedError, Sendable {
     case .folderProtectionExists:
       return "此文件夹已设置访问密码，请先凭原密码取消。"
     case .protectedFolderDeletion:
-      return "此文件夹或其子文件夹仍有密码保护，请先取消相关文件夹密码再删除。"
+      return "此项目位于受保护的文件夹中，或包含受保护的子文件夹，请先取消相关文件夹密码再删除。"
     case .protectedFolderExport:
       return "此项目位于受保护的文件夹中，或包含受保护的子文件夹，请先取消相关文件夹密码再导出。"
     case .protectedFolderMove:
-      return "受密码保护的文件夹不能移动；其中文件也不能移出保护范围，请先取消相关文件夹密码。"
+      return "受密码保护的文件夹及包含保护子目录的目录树不能移动；普通目录树不能移出祖先的保护范围。文件需重新验证来源文件夹密码后移动。"
     case .invalidFolderName:
       return "请输入有效文件夹名称，不能含路径分隔符，且不能与同级项目重名。"
     case .invalidFileName:
@@ -326,6 +356,25 @@ struct FolderPassword: Codable, Sendable, Equatable {
   let verification: Data
 }
 
+/// ROOT 独立密码的校验材料，整体仅保存在保险箱主密钥保护的密文中。
+struct RootPassword: Codable, Sendable, Equatable {
+  let revision: UUID
+  let salt: Data
+  let iterations: Int
+  let verification: Data
+}
+
+/// 照片内部资源的展示入口，附件继续由同一加密目录关系管理。
+struct VaultPhotoAsset: Codable, Sendable, Equatable {
+  let primaryID: UUID
+  let contentType: String
+  let byteCount: UInt64
+  let sha256: Data
+  let totalByteCount: UInt64
+  let resourceCount: Int
+  let manifestID: UUID
+}
+
 /// 已解锁后可展示的媒体信息，不包含任何查看时间或播放进度。
 struct VaultMedia: Codable, Identifiable, Sendable, Equatable {
   let id: UUID
@@ -335,19 +384,36 @@ struct VaultMedia: Codable, Identifiable, Sendable, Equatable {
   let sha256: Data
   var parentID: UUID? = nil
   var folderPassword: FolderPassword? = nil
+  var hidden: Bool? = nil
+  var photoAsset: VaultPhotoAsset? = nil
+
+  /// 业务作用：把文档包及带配套资源的照片作为单个文件操作，不开放普通目录管理入口。
+  /// 参数说明：无。
+  /// 返回：条目使用内部目录保存完整文件内容时为真，不表示用户创建的普通文件夹。
+  var isFilePackage: Bool {
+    isFolder && (photoAsset != nil || isDocument)
+  }
+
+  /// 业务作用：将隐藏标记限定为普通文件夹，旧元数据缺少标记时保持可见。
+  /// 参数说明：无。
+  /// 返回：普通文件夹已设置隐藏时为真；文件、文档包及照片包不具有隐藏状态。
+  var isHidden: Bool {
+    isFolder && !isFilePackage && hidden == true
+  }
 
   /// 业务作用：按认证内容类型选择视频播放入口，不依赖文件扩展名。
   /// 参数说明：无。
   /// 返回：真实内容被识别为视频时为真。
   var isVideo: Bool {
-    UTType(contentType)?.conforms(to: .movie) == true || contentType == "public.movie"
+    let type = photoAsset?.contentType ?? contentType
+    return UTType(type)?.conforms(to: .movie) == true || type == "public.movie"
   }
 
   /// 业务作用：按认证内容类型选择本地图片解码入口。
   /// 参数说明：无。
   /// 返回：内容类型符合图片类型时为真。
   var isImage: Bool {
-    UTType(contentType)?.conforms(to: .image) == true
+    UTType(photoAsset?.contentType ?? contentType)?.conforms(to: .image) == true
   }
 
   /// 业务作用：区分携带加密目录关系的零载荷条目与普通文件。
@@ -388,10 +454,10 @@ struct VaultMedia: Codable, Identifiable, Sendable, Equatable {
 
   /// 业务作用：为列表和辅助功能提供与实际操作入口一致的文件类型说明。
   /// 参数说明：无。
-  /// 返回：目录、视频、图片或普通文件的本地说明。
+  /// 返回：普通或隐藏文件夹、视频、图片或普通文件的本地说明。
   var kindTitle: String {
-    if isFolder && !isDocument {
-      return "文件夹"
+    if isFolder && !isFilePackage {
+      return isHidden ? "隐藏文件夹" : "文件夹"
     }
     if isVideo {
       return "视频"
@@ -403,7 +469,7 @@ struct VaultMedia: Codable, Identifiable, Sendable, Equatable {
   /// 参数说明：无。
   /// 返回：系统文件类型图标名称。
   var symbolName: String {
-    if isFolder && !isDocument {
+    if isFolder && !isFilePackage {
       return "folder.fill"
     }
     if isVideo {

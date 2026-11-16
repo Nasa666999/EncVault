@@ -6,11 +6,16 @@ import SwiftUI
   import AppKit
 
   /// 只承载画面层，不接入系统播放器控制器和文档恢复。
-  final class VaultVideoView: NSView {
+  final class VaultVideoView: NSView, NSGestureRecognizerDelegate {
     let videoLayer = AVPlayerLayer()
     let compatibilityView = VLCVideoView()
+    weak var playback: LocalPlayback?
+    var onScrub: (Double?) -> Void = { _ in }
+    private(set) var scrubPan: NSPanGestureRecognizer!
+    private var scrubOrigin: (position: Double, duration: Double, width: CGFloat)?
+    private var horizontalScrub = false
 
-    /// 业务作用：创建仅供保险箱当前会话使用的媒体画面。
+    /// 业务作用：创建仅供当前保险箱会话使用的媒体画面，接收鼠标左键横向进度预览。
     /// 参数说明：
     /// - `frameRect`：初始画面区域。
     /// 返回：没有媒体地址和历史记录的画面层。
@@ -24,6 +29,13 @@ import SwiftUI
       compatibilityView.backColor = .black
       compatibilityView.fillScreen = false
       addSubview(compatibilityView)
+      let pan = NSPanGestureRecognizer(target: self, action: #selector(receiveScrub(_:)))
+      pan.buttonMask = 0x1
+      pan.allowedTouchTypes = []
+      pan.delegate = self
+      pan.isEnabled = false
+      addGestureRecognizer(pan)
+      scrubPan = pan
     }
 
     /// 业务作用：拒绝从归档恢复媒体画面。
@@ -39,14 +51,131 @@ import SwiftUI
     /// 返回：画面层覆盖当前可用区域。
     override func layout() {
       super.layout()
+      // 窗口布局只调整现有画面边界，不为连续进度刷新引入隐式图层动画。
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
       videoLayer.frame = bounds
       compatibilityView.frame = bounds
+      CATransaction.commit()
     }
 
+    /// 业务作用：允许在当前视频画面第一次按下左键时就开始拖动，不丢失本次起点。
+    /// 参数说明：
+    /// - `event`：用户按下鼠标按钮的事件。
+    /// 返回：已开放定位时接收左键，其他输入沿用系统的窗口激活行为。
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+      if event?.buttonNumber == 0, scrubPan?.isEnabled == true {
+        return true
+      }
+      return super.acceptsFirstMouse(for: event)
+    }
+
+    /// 业务作用：仅让当前已绑定的视频画面接收鼠标左键拖动，方向由实际位移判定。
+    /// 参数说明：
+    /// - `gestureRecognizer`：请求开始的画面手势。
+    /// 返回：当前画面和时长有效时开始追踪，不依赖识别开始前尚未建立的速度值。
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
+      guard gestureRecognizer === scrubPan, window != nil, !isHiddenOrHasHiddenAncestor,
+        let playback, playback.duration.isFinite, playback.duration > 0,
+        playback.position.isFinite, bounds.width.isFinite, bounds.width > 0
+      else {
+        return false
+      }
+      return true
+    }
+
+    /// 业务作用：让画面点击与横向拖动分别识别，保留工具栏显隐和双击全屏入口。
+    /// 参数说明：
+    /// - `gestureRecognizer`：当前画面手势。
+    /// - `otherGestureRecognizer`：同一鼠标事件序列中的其它手势。
+    /// 返回：允许同时识别，定位仍只接收鼠标左键拖动。
+    func gestureRecognizer(
+      _ gestureRecognizer: NSGestureRecognizer,
+      shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+    ) -> Bool {
+      true
+    }
+
+    /// 业务作用：撤销未完成的进度预览，防止切换媒体或拆除画面后提交旧手势。
+    /// 参数说明：
+    /// - `notify`：是否通知当前查看区撤下预览；视图重新绑定时由查看区清空。
+    /// 返回：取消当前识别且不跳转，后续拖动从新的播放位置开始。
+    func cancelScrub(notify: Bool = true) {
+      let hadPreview = horizontalScrub
+      scrubOrigin = nil
+      horizontalScrub = false
+      let enabled = scrubPan.isEnabled
+      scrubPan.isEnabled = false
+      scrubPan.isEnabled = enabled
+      if hadPreview && notify {
+        onScrub(nil)
+      }
+    }
+
+    /// 业务作用：鼠标左键拖动期间连续预览当前视频进度，正常松开时提交一次定位。
+    /// 参数说明：
+    /// - `recognizer`：仅接收左键拖动的画面识别器。
+    /// 返回：以开始时的进度和画面宽度计算目标，取消、撤下画面或布局变化时放弃定位。
+    @objc private func receiveScrub(_ recognizer: NSPanGestureRecognizer) {
+      // 只接收当前画面的鼠标事件，撤下或隐藏画面后旧拖动不得继续发布进度。
+      guard let playback, window != nil, !isHiddenOrHasHiddenAncestor else {
+        cancelScrub()
+        return
+      }
+      switch recognizer.state {
+      case .began:
+        scrubOrigin = (playback.position, playback.duration, bounds.width)
+        horizontalScrub = false
+      case .changed, .ended:
+        break
+      default:
+        cancelScrub()
+        return
+      }
+      // 调整窗口后原坐标不再可靠，放弃旧目标以免跳到错误位置。
+      guard let origin = scrubOrigin, origin.width == bounds.width,
+        origin.width.isFinite, origin.width > 0,
+        origin.position.isFinite, origin.duration.isFinite, origin.duration > 0
+      else {
+        cancelScrub()
+        return
+      }
+      let translation = recognizer.translation(in: self)
+      guard translation.x.isFinite, translation.y.isFinite else {
+        cancelScrub()
+        return
+      }
+      if !horizontalScrub {
+        if abs(translation.y) >= 8, abs(translation.y) > abs(translation.x) * 1.3 {
+          cancelScrub()
+          return
+        }
+        guard abs(translation.x) >= 8, abs(translation.x) > abs(translation.y) * 1.3 else {
+          if recognizer.state == .ended {
+            cancelScrub()
+          }
+          return
+        }
+        horizontalScrub = true
+      }
+      // 固定本次拖动的起点，播放采样与往返拖动都不能累加改变定位基准。
+      let fraction = Double(min(1, max(-1, translation.x / origin.width)))
+      let target = min(
+        origin.duration, max(0, origin.position + fraction * min(origin.duration, 120)))
+      onScrub(target)
+      if recognizer.state == .ended {
+        scrubOrigin = nil
+        horizontalScrub = false
+        playback.seek(target)
+        onScrub(nil)
+      }
+    }
   }
 
   struct PlayerSurface: NSViewRepresentable {
     @ObservedObject var playback: LocalPlayback
+    var scrubbingEnabled = false
+    var onScrub: (Double?) -> Void = { _ in }
 
     /// 业务作用：连接当前会话播放器与自有画面层。
     /// 参数说明：
@@ -67,14 +196,30 @@ import SwiftUI
       bind(view)
     }
 
-    /// 业务作用：在同一自有画面中切换系统和兼容解码，保持比例且不新增播放窗口。
+    /// 业务作用：在同一画面绑定解码器与左键进度手势，媒体变化时撤销旧拖动。
     /// 参数说明：
     /// - `view`：当前查看区的原生画面。
     /// 返回：只有当前采用的解码器可以绘制视频。
     private func bind(_ view: VaultVideoView) {
+      // 更换媒体或关闭交互时先撤销旧识别，后续事件只能访问新绑定的播放器。
+      if view.playback !== playback || !scrubbingEnabled {
+        view.cancelScrub(notify: false)
+      }
+      view.playback = playback
+      view.onScrub = onScrub
+      if view.scrubPan.isEnabled != scrubbingEnabled {
+        view.scrubPan.isEnabled = scrubbingEnabled
+      }
       let compatible = playback.compatiblePlayer != nil
       view.videoLayer.isHidden = compatible
-      view.videoLayer.player = compatible ? nil : playback.player
+      let player = compatible ? nil : playback.player
+      // 进度采样与拖动预览会频繁刷新视图，同一播放器不能反复重新挂接画面层。
+      if view.videoLayer.player !== player {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.videoLayer.player = player
+        CATransaction.commit()
+      }
       view.compatibilityView.isHidden = !compatible
       if compatible {
         playback.attachCompatibility(to: view.compatibilityView)
@@ -87,6 +232,10 @@ import SwiftUI
     /// - `coordinator`：默认生命周期协调器。
     /// 返回：画面层不再持有播放器。
     static func dismantleNSView(_ view: VaultVideoView, coordinator: ()) {
+      view.cancelScrub(notify: false)
+      view.scrubPan.isEnabled = false
+      view.playback = nil
+      view.onScrub = { _ in }
       view.videoLayer.player = nil
       view.compatibilityView.removeFromSuperview()
     }
@@ -209,10 +358,14 @@ import SwiftUI
     }
   }
 
-  final class VaultVideoView: UIView {
+  final class VaultVideoView: UIView, UIGestureRecognizerDelegate {
     let compatibilityView = UIView()
+    weak var playback: LocalPlayback?
+    var onScrub: (Double?) -> Void = { _ in }
+    private(set) var scrubPan: UIPanGestureRecognizer!
+    private var scrubOrigin: (position: Double, duration: Double, width: CGFloat)?
 
-    /// 业务作用：创建当前视频的两种自有画面承载层，不接入系统媒体控制器。
+    /// 业务作用：创建当前视频的两种自有画面承载层，接收单指横向进度预览。
     /// 参数说明：
     /// - `frame`：当前初始画面区域。
     /// 返回：默认只开放系统画面，兼容画面等待明确绑定。
@@ -221,6 +374,14 @@ import SwiftUI
       compatibilityView.backgroundColor = .black
       compatibilityView.isHidden = true
       addSubview(compatibilityView)
+      let pan = UIPanGestureRecognizer(target: self, action: #selector(receiveScrub(_:)))
+      pan.minimumNumberOfTouches = 1
+      pan.maximumNumberOfTouches = 1
+      pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+      pan.delegate = self
+      pan.isEnabled = false
+      addGestureRecognizer(pan)
+      scrubPan = pan
     }
 
     /// 业务作用：拒绝归档恢复过去的视频画面。
@@ -244,10 +405,100 @@ import SwiftUI
     override class var layerClass: AnyClass {
       AVPlayerLayer.self
     }
+
+    /// 业务作用：仅让当前前台视频中的单指横向拖动取得进度预览权限。
+    /// 参数说明：
+    /// - `gestureRecognizer`：请求开始的画面手势。
+    /// 返回：时长和画面有效且主要横向移动时允许开始，纵向操作不改变进度。
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+      guard gestureRecognizer === scrubPan,
+        window?.windowScene?.activationState == .foregroundActive,
+        let playback, playback.duration.isFinite, playback.duration > 0,
+        playback.position.isFinite, bounds.width.isFinite, bounds.width > 0
+      else {
+        return false
+      }
+      let velocity = scrubPan.velocity(in: self)
+      return velocity.x.isFinite && velocity.y.isFinite
+        && abs(velocity.x) > abs(velocity.y) * 1.3
+    }
+
+    /// 业务作用：让画面的点击与横向拖动分别识别，保留工具栏显隐和双击全屏入口。
+    /// 参数说明：
+    /// - `gestureRecognizer`：当前画面手势。
+    /// - `otherGestureRecognizer`：同一触摸序列中的其它手势。
+    /// 返回：允许同时识别，直接拖动仍限制为单指。
+    func gestureRecognizer(
+      _ gestureRecognizer: UIGestureRecognizer,
+      shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+      true
+    }
+
+    /// 业务作用：撤销未完成的进度预览，防止切换媒体或拆除画面后提交旧手势。
+    /// 参数说明：
+    /// - `notify`：是否通知当前查看区撤下预览；视图重新绑定时由查看区清空。
+    /// 返回：取消当前识别且不跳转，后续触摸从新的播放位置开始。
+    func cancelScrub(notify: Bool = true) {
+      let hadPreview = scrubOrigin != nil
+      scrubOrigin = nil
+      let enabled = scrubPan.isEnabled
+      scrubPan.isEnabled = false
+      scrubPan.isEnabled = enabled
+      if hadPreview && notify {
+        onScrub(nil)
+      }
+    }
+
+    /// 业务作用：滑动期间连续预览当前视频进度，只有正常抬手才提交一次播放定位。
+    /// 参数说明：
+    /// - `recognizer`：仅接收屏幕单指触摸的画面拖动识别器。
+    /// 返回：以开始时的进度和画面宽度计算目标，取消、失去前台或画面变化时放弃定位。
+    @objc private func receiveScrub(_ recognizer: UIPanGestureRecognizer) {
+      // 失去前台或播放器绑定后，旧手势不得继续发布进度或恢复播放。
+      guard let playback, window?.windowScene?.activationState == .foregroundActive else {
+        cancelScrub()
+        return
+      }
+      switch recognizer.state {
+      case .began:
+        scrubOrigin = (playback.position, playback.duration, bounds.width)
+      case .changed, .ended:
+        break
+      default:
+        cancelScrub()
+        return
+      }
+      // 旋转或重排画面后旧坐标不再可靠，放弃旧目标以免跳到错误位置。
+      guard let origin = scrubOrigin, origin.width == bounds.width,
+        origin.width.isFinite, origin.width > 0,
+        origin.position.isFinite, origin.duration.isFinite, origin.duration > 0
+      else {
+        cancelScrub()
+        return
+      }
+      let translation = recognizer.translation(in: self).x
+      guard translation.isFinite else {
+        cancelScrub()
+        return
+      }
+      // 固定本次滑动的起点，连续播放采样和往返拖动都不能累加改变定位基准。
+      let fraction = Double(min(1, max(-1, translation / origin.width)))
+      let target = min(
+        origin.duration, max(0, origin.position + fraction * min(origin.duration, 120)))
+      onScrub(target)
+      if recognizer.state == .ended {
+        scrubOrigin = nil
+        playback.seek(target)
+        onScrub(nil)
+      }
+    }
   }
 
   struct PlayerSurface: UIViewRepresentable {
     @ObservedObject var playback: LocalPlayback
+    var scrubbingEnabled = false
+    var onScrub: (Double?) -> Void = { _ in }
 
     /// 业务作用：连接当前会话播放器与自有画面层。
     /// 参数说明：
@@ -270,13 +521,30 @@ import SwiftUI
       bind(view)
     }
 
-    /// 业务作用：在当前应用画面中选择解码器，兼容模式不生成外部播放器界面。
+    /// 业务作用：在当前应用画面中绑定解码器与进度手势，媒体变化时撤销旧手势。
     /// 参数说明：
     /// - `view`：当前查看区的原生画面。
-    /// 返回：当前采用的解码器完成绑定，另一画面停止绘制。
+    /// 返回：当前采用的解码器完成绑定，只有仍开放交互的画面可以预览进度。
     private func bind(_ view: VaultVideoView) {
+      // 更换媒体或关闭交互时先撤销旧识别，后续事件只能访问新绑定的播放器。
+      if view.playback !== playback || !scrubbingEnabled {
+        view.cancelScrub(notify: false)
+      }
+      view.playback = playback
+      view.onScrub = onScrub
+      if view.scrubPan.isEnabled != scrubbingEnabled {
+        view.scrubPan.isEnabled = scrubbingEnabled
+      }
       let compatible = playback.compatiblePlayer != nil
-      (view.layer as? AVPlayerLayer)?.player = compatible ? nil : playback.player
+      let layer = view.layer as? AVPlayerLayer
+      let player = compatible ? nil : playback.player
+      // 预览进度变化只更新控制栏，保持原画面层绑定，避免重复挂接触发画面重绘。
+      if layer?.player !== player {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.player = player
+        CATransaction.commit()
+      }
       view.compatibilityView.isHidden = !compatible
       if compatible {
         playback.attachCompatibility(to: view.compatibilityView)
@@ -289,6 +557,10 @@ import SwiftUI
     /// - `coordinator`：默认生命周期协调器。
     /// 返回：画面层不再持有播放器。
     static func dismantleUIView(_ view: VaultVideoView, coordinator: ()) {
+      view.cancelScrub(notify: false)
+      view.scrubPan.isEnabled = false
+      view.playback = nil
+      view.onScrub = { _ in }
       (view.layer as? AVPlayerLayer)?.player = nil
       view.compatibilityView.removeFromSuperview()
     }
@@ -301,6 +573,7 @@ struct VaultPlayerControls: View {
   let fullScreen: Bool
   let toggleFullScreen: () -> Void
   var rotateVideo: (() -> Void)? = nil
+  var previewPosition: Double? = nil
   @State private var scrub: Double = 0
   @State private var dragging = false
 
@@ -371,12 +644,15 @@ struct VaultPlayerControls: View {
     }
     .onAppear {
       // 新建控件时沿用当前会话位置，暂停或布局变化时也不能把滑块显示为起点。
-      scrub = playback.position
+      scrub = previewPosition ?? playback.position
     }
     .onChange(of: playback.position) { _, value in
-      if !dragging {
+      if !dragging && previewPosition == nil {
         scrub = value
       }
+    }
+    .onChange(of: previewPosition) { _, value in
+      scrub = value ?? playback.position
     }
   }
 
@@ -410,15 +686,18 @@ struct VaultPlayerControls: View {
     .buttonStyle(.borderless)
     .accessibilityLabel(forward ? "前进15秒" : "回退5秒")
     .help(forward ? "前进 15 秒" : "回退 5 秒")
-    .disabled(dragging || playback.duration <= 0)
+    .disabled(dragging || previewPosition != nil || playback.duration <= 0)
   }
 
-  /// 业务作用：只在用户结束本次拖动后定位视频，连续播放采样不会覆盖正在选择的位置。
+  /// 业务作用：实时显示滑块或画面拖动的预览位置，抬手后才定位视频。
   /// 参数说明：无。
   /// 返回：属于当前播放器的进度滑块，未知时长时禁用定位。
   private var progressSlider: some View {
     Slider(
-      value: $scrub, in: 0...max(1, playback.duration),
+      value: Binding(
+        get: { previewPosition ?? scrub },
+        set: { scrub = $0 }),
+      in: 0...max(1, playback.duration),
       onEditingChanged: { editing in
         dragging = editing
         if !editing {
@@ -428,15 +707,16 @@ struct VaultPlayerControls: View {
     )
     .accessibilityLabel("播放进度")
     .disabled(playback.duration <= 0)
+    .allowsHitTesting(previewPosition == nil)
   }
 
-  /// 业务作用：展示当前会话时间与总时长，不占用手机进度滑块的水平空间。
+  /// 业务作用：与滑块同步显示当前或预览时间，不占用手机进度滑块的水平空间。
   /// 参数说明：无。
   /// 返回：等宽数字时间标签，未知总时长时显示明确状态。
   private var playbackTime: some View {
     Text(
       playback.duration > 0
-        ? "\(time(playback.position)) / \(time(playback.duration))"
+        ? "\(time(previewPosition ?? scrub)) / \(time(playback.duration))"
         : "\(time(playback.position)) · 时长未知"
     )
     .monospacedDigit().font(.caption)

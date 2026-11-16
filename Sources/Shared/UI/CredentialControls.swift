@@ -926,6 +926,144 @@ struct FolderPasswordFieldRow: View {
   }
 }
 
+/// ROOT 弹窗从当前模型读取验证身份，连续验证不沿用旧表单快照。
+struct RootPasswordPresentation: View {
+  @ObservedObject var model: VaultModel
+  let presentationID: UUID
+
+  /// 业务作用：仅向当前 ROOT 请求提供独立输入页，验证失败或设置完成后更换输入身份。
+  /// 参数说明：无。
+  /// 返回：当前请求对应的密码页面；旧呈现不能提交到后来的请求。
+  var body: some View {
+    if let prompt = model.rootPrompt, prompt.id == presentationID {
+      RootPasswordForm(model: model, prompt: prompt).id(prompt.challengeID)
+    }
+  }
+}
+
+/// ROOT 输入拥有独立草稿，设置与每次开启都不复用 App 或目录密码。
+private struct RootPasswordForm: View {
+  @ObservedObject var model: VaultModel
+  let prompt: VaultModel.RootPrompt
+  @Environment(\.scenePhase) private var scenePhase
+  @StateObject private var password = FolderPasswordDraft()
+  @StateObject private var confirmation = FolderPasswordDraft()
+  @StateObject private var newPassword = FolderPasswordDraft()
+  @State private var localError: String?
+
+  /// 业务作用：为首次设置及每次开启 ROOT 提供独立密码输入，关闭模式无需使用此表单。
+  /// 参数说明：无。
+  /// 返回：当前 ROOT 表单及提交入口，离开前台或关闭时清空输入。
+  var body: some View {
+    #if os(iOS)
+      ScrollView {
+        fields
+      }
+      .scrollDismissesKeyboard(.interactively)
+    #else
+      fields
+    #endif
+  }
+
+  /// 业务作用：组合 ROOT 原密码、新密码与确认输入，手机键盘出现时由外层滚动保留提交入口。
+  /// 参数说明：无。
+  /// 返回：与当前设置、开启或修改请求一致的独立密码字段及动作。
+  private var fields: some View {
+    VStack(alignment: .leading, spacing: 18) {
+      Label("ROOT 权限", systemImage: "key.fill").font(.headline)
+      Text(
+        prompt.kind == .setting
+          ? "请先设置 ROOT 独立密码" : prompt.kind == .changing ? "修改 ROOT 权限密码" : "验证 ROOT 密码"
+      )
+      .font(.title2.weight(.semibold))
+      Text("此密码独立于 App 密码、手势密码和文件夹保护密码。ROOT 不会取消文件夹原有的密码保护。")
+        .font(.callout).foregroundStyle(.secondary)
+      FolderPasswordFieldRow(
+        title: prompt.kind == .setting
+          ? "新 ROOT 密码" : prompt.kind == .changing ? "原 ROOT 密码" : "ROOT 密码",
+        draft: password, enabled: !model.busy)
+      if prompt.kind == .changing {
+        FolderPasswordFieldRow(title: "新 ROOT 密码", draft: newPassword, enabled: !model.busy)
+      }
+      if prompt.kind != .unlocking {
+        FolderPasswordFieldRow(
+          title: "再次确认 ROOT 密码", draft: confirmation, enabled: !model.busy)
+        Text("使用 6 至 128 个字符。保存后仍需验证才能开启 ROOT。")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        Text("每次开启都需要验证；关闭 ROOT 直接生效，不需要密码。")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      if let error = localError ?? model.message {
+        Text(error).font(.callout).foregroundStyle(.red)
+      }
+      HStack {
+        Button("取消", role: .cancel) {
+          clearDraft()
+          model.cancelRootPrompt()
+        }
+        .disabled(model.busy)
+        Spacer()
+        if model.busy {
+          ProgressView().controlSize(.small)
+        }
+        Button(
+          prompt.kind == .setting
+            ? "保存 ROOT 密码" : prompt.kind == .changing ? "修改 ROOT 密码" : "验证并开启 ROOT"
+        ) {
+          submit()
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(model.busy || password.isEmpty)
+      }
+    }
+    .padding(24)
+    .frame(maxWidth: 460)
+    #if os(macOS)
+      .frame(minWidth: 360)
+    #else
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    #endif
+    .onChange(of: scenePhase) { _, phase in
+      if phase != .active {
+        clearDraft()
+      }
+    }
+    .onDisappear(perform: clearDraft)
+    .privacySensitive()
+  }
+
+  /// 业务作用：取得本轮原生输入快照，首次设置必须两次完全一致后才允许持久化。
+  /// 参数说明：无。
+  /// 返回：不一致时保留关闭状态并提示，提交后输入原文从控件移除。
+  private func submit() {
+    guard !model.busy else {
+      return
+    }
+    let value = password.take()
+    let changed = newPassword.take()
+    let repeated = confirmation.take()
+    let candidate = prompt.kind == .changing ? changed : value
+    if prompt.kind != .unlocking, !candidate.utf8.elementsEqual(repeated.utf8) {
+      localError = "两次 ROOT 密码不一致，请重新输入。"
+      return
+    }
+    localError = nil
+    model.submitRootPassword(
+      value, newPassword: prompt.kind == .changing ? changed : nil, challengeID: prompt.challengeID)
+  }
+
+  /// 业务作用：关闭或离开 ROOT 表单时释放全部密码输入，不创建输入历史。
+  /// 参数说明：无。
+  /// 返回：本次密码、确认输入及本地错误提示全部清空。
+  private func clearDraft() {
+    password.clear()
+    confirmation.clear()
+    newPassword.clear()
+    localError = nil
+  }
+}
+
 /// 弹窗持有呈现身份，具体目录与验证代次始终从当前模型读取，连续验证不能沿用旧表单快照。
 struct FolderPasswordPresentation: View {
   @ObservedObject var model: VaultModel
@@ -976,6 +1114,9 @@ struct FolderPasswordForm: View {
           .font(.caption).foregroundStyle(.secondary)
       } else if prompt.kind == .copy {
         Text("仅授权本次解密复制，保险箱内的密码保护保持不变。嵌套受保护目录需要分别验证。")
+          .font(.caption).foregroundStyle(.secondary)
+      } else if prompt.kind == .moveSource {
+        Text("重新验证来源文件夹密码后才会移动。文件移入其它目录后，按目标目录的保护规则访问。取消或密码不正确时，来源保持原位。")
           .font(.caption).foregroundStyle(.secondary)
       } else if prompt.kind == .move {
         Text("验证目标文件夹密码后才会移入。取消或密码不正确时，来源保持原位。")
@@ -1036,6 +1177,8 @@ struct FolderPasswordForm: View {
       return "复制前验证文件夹密码"
     case .move:
       return "移入前验证文件夹密码"
+    case .moveSource:
+      return "移动前验证来源文件夹密码"
     case .rename:
       return "重命名前验证文件夹密码"
     case .setting:

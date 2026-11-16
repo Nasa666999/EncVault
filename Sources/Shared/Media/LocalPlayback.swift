@@ -502,6 +502,7 @@ final class LocalPlayback: ObservableObject {
   private var endObserver: NSObjectProtocol?
   private var playbackRevision: UInt64 = 0
   private var nativeSeekRevision: UInt64?
+  private var compatibilitySeekTarget: (seconds: Double, deadline: ContinuousClock.Instant)?
   private var replaying = false
   private var statusObserver: NSKeyValueObservation?
   private var durationObserver: NSKeyValueObservation?
@@ -521,6 +522,7 @@ final class LocalPlayback: ObservableObject {
     player = AVPlayer(playerItem: item)
     player.allowsExternalPlayback = false
     player.audiovisualBackgroundPlaybackPolicy = .pauses
+    // iPhone 的保亮由前台会话统一控制，两套解码器共用暂停、锁定和失焦时的撤销边界。
     player.preventsDisplaySleepDuringVideoPlayback = false
     player.actionAtItemEnd = .pause
     endObserver = NotificationCenter.default.addObserver(
@@ -594,6 +596,10 @@ final class LocalPlayback: ObservableObject {
       let decoder = VLCMediaPlayer(library: library)
       decoder.media = media
       // 先停止系统读取再开放兼容解码，两个解码器不能同时持有可播放的画面。
+      playbackRevision &+= 1
+      nativeSeekRevision = nil
+      compatibilitySeekTarget = nil
+      replaying = false
       player.pause()
       player.replaceCurrentItem(with: nil)
       resource.loader.cancelAll()
@@ -714,18 +720,28 @@ final class LocalPlayback: ObservableObject {
     }
   }
 
-  /// 业务作用：把播放器当前状态同步到本次查看的界面，暂停后立即稳定显示位置。
+  /// 业务作用：同步播放器状态，定位期间维持已选择的目标，完成后再交给实际进度采样。
   /// 参数说明：无。
   /// 返回：内存中的进度、时长和播放状态更新，不写入文件或系统媒体信息。
   private func refreshState() {
     if let decoder = compatiblePlayer {
-      position = max(0, (decoder.time.value?.doubleValue ?? 0) / 1000)
+      let current = max(0, (decoder.time.value?.doubleValue ?? 0) / 1000)
       duration = max(0, (decoder.media?.length.value?.doubleValue ?? 0) / 1000)
-      playing = decoder.isPlaying
+      // 异步定位尚未到达目标时不能用旧采样回退滑块；解码失败或超时后恢复实际进度。
+      if let target = compatibilitySeekTarget,
+        abs(current - target.seconds) <= 0.75 || ContinuousClock.now >= target.deadline
+          || decoder.state == .error
+      {
+        compatibilitySeekTarget = nil
+      }
+      if compatibilitySeekTarget == nil {
+        position = current
+      }
+      playing = decoder.isPlaying || compatibilitySeekTarget != nil && requestedPlay
       if decoder.state == .playing || decoder.state == .opening {
         compatibilityStarted = true
       }
-      if decoder.state == .stopped, compatibilityStarted {
+      if decoder.state == .stopped, compatibilityStarted, compatibilitySeekTarget == nil {
         compatibilityStarted = false
         finishedPlayback()
       }
@@ -738,9 +754,12 @@ final class LocalPlayback: ObservableObject {
     }
     let current = player.currentTime().seconds
     let length = player.currentItem?.duration.seconds ?? 0
-    position = current.isFinite ? max(0, current) : 0
+    // 定位完成回调负责交接目标与实际进度，排队的旧采样不能抢先覆盖手指选择的位置。
+    if nativeSeekRevision == nil {
+      position = current.isFinite ? max(0, current) : 0
+    }
     duration = length.isFinite ? max(0, length) : 0
-    playing = player.rate > 0 || replaying && requestedPlay
+    playing = player.rate > 0 || (replaying || nativeSeekRevision != nil) && requestedPlay
   }
 
   /// 业务作用：仅在仍有播放意图和当前会话授权时重播当前视频，关闭循环时结束播放。
@@ -778,12 +797,15 @@ final class LocalPlayback: ObservableObject {
   /// 参数说明：
   /// - `seconds`：本次明确跳转或片尾回卷的目标秒数。
   /// - `automaticRepeat`：本次是否由循环触发，完成时仍需保持循环开启。
-  /// 返回：当前操作仍有效时按播放意图继续；取消或失权时保持停止。
+  /// 返回：先稳定显示目标并暂停旧位置输出，定位成功且仍有授权时按原播放意图继续。
   private func seekNative(to seconds: Double, automaticRepeat: Bool) {
     playbackRevision &+= 1
     let revision = playbackRevision
     nativeSeekRevision = revision
     replaying = automaticRepeat
+    position = seconds
+    // 先暂停旧位置输出，待本次定位完成并复验授权后再恢复，避免旧帧与目标帧交错呈现。
+    player.pause()
     player.seek(
       to: CMTime(seconds: seconds, preferredTimescale: 600),
       toleranceBefore: .zero, toleranceAfter: .zero
@@ -821,17 +843,20 @@ final class LocalPlayback: ObservableObject {
   /// 业务作用：响应用户在当前会话内拖动进度，不保存跳转位置。
   /// 参数说明：
   /// - `seconds`：需要跳转的媒体时间。
-  /// 返回：发出范围受限的本地跳转，关闭后不执行。
+  /// 返回：目标立即接管界面进度，定位完成后恢复实际采样；关闭后不执行。
   func seek(_ seconds: Double) {
     guard !closed, seconds.isFinite else {
       return
     }
     if let decoder = compatiblePlayer {
-      guard duration > 0, decoder.isSeekable else {
+      guard duration.isFinite, duration > 0, decoder.isSeekable else {
         return
       }
       // 有准确长度的本地输入使用归一化位置，兼容不提供按时间索引的容器。
-      decoder.position = min(max(0, seconds / duration), 1)
+      let target = min(max(0, seconds), duration)
+      compatibilitySeekTarget = (target, ContinuousClock.now.advanced(by: .seconds(2)))
+      position = target
+      decoder.position = target / duration
       return
     }
     seekNative(to: min(max(0, seconds), max(0, duration)), automaticRepeat: false)
@@ -847,6 +872,7 @@ final class LocalPlayback: ObservableObject {
     closed = true
     playbackRevision &+= 1
     nativeSeekRevision = nil
+    compatibilitySeekTarget = nil
     replaying = false
     // 撤下画面和输入后才停止解码器，迟到的解码请求不能再次获得明文。
     compatibilityPoll?.cancel()

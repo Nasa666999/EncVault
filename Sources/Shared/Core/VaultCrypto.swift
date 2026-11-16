@@ -7,6 +7,72 @@ import Security
 enum VaultCrypto {
   static let rounds = 600_000
 
+  /// 业务作用：校验 ROOT 独立文本密码，并使用独立用途前缀隔离其它凭据。
+  /// 参数说明：
+  /// - `password`：本次输入的 ROOT 密码，保留原始大小写与空格。
+  /// 返回：合法密码的派生输入；空白、字符数或字节数超限时拒绝。
+  private static func rootPasswordBytes(_ password: String) throws -> Data {
+    guard (6...128).contains(password.count), password.utf8.count <= 512,
+      !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+      throw VaultError.invalidRootPassword
+    }
+    return Data(("root-password:" + password).utf8)
+  }
+
+  /// 业务作用：为 ROOT 模式创建独立盐和慢速派生的校验封套，不使用 App 或目录凭据。
+  /// 参数说明：
+  /// - `password`：用户两次确认一致的 ROOT 密码。
+  /// - `grant`：当前已解锁的 App 会话，仅提供本保险箱的随机密钥因子。
+  /// 返回：绑定保险箱及校验身份的材料，不包含原始密码。
+  static func rootPassword(_ password: String, using grant: VaultGrant) throws -> RootPassword {
+    let bytes = try rootPasswordBytes(password)
+    let revision = UUID()
+    let salt = try random(16)
+    let context = Data("EncVault/root/\(grant.vaultID)/\(revision)".utf8)
+    let factor = try grant.access { root in
+      root
+    }
+    let key = try credentialKey(
+      credential: bytes, salt: salt, device: factor, iterations: rounds, context: context)
+    try Task.checkCancellation()
+    try grant.check()
+    return RootPassword(
+      revision: revision, salt: salt, iterations: rounds,
+      verification: try seal(Data("root-access".utf8), key: key, context: context))
+  }
+
+  /// 业务作用：只用 ROOT 密码的独立派生域验证 ROOT 校验封套，不发放目录访问权。
+  /// 参数说明：
+  /// - `password`：本次 ROOT 密码原文，仅在内存中使用。
+  /// - `protection`：从保险箱认证密文读取的 ROOT 校验材料。
+  /// - `grant`：当前已解锁且仍有效的 App 会话。
+  /// 返回：密码及绑定身份正确时成功；材料损坏、密码错误或会话失效时拒绝。
+  static func verifyRootPassword(
+    _ password: String, protection: RootPassword, using grant: VaultGrant
+  ) throws {
+    guard protection.salt.count == 16, protection.iterations >= rounds,
+      protection.iterations <= 3_000_000
+    else {
+      throw VaultError.corrupt
+    }
+    let bytes = try rootPasswordBytes(password)
+    let context = Data("EncVault/root/\(grant.vaultID)/\(protection.revision)".utf8)
+    let factor = try grant.access { root in
+      root
+    }
+    let key = try credentialKey(
+      credential: bytes, salt: protection.salt, device: factor,
+      iterations: protection.iterations, context: context)
+    try Task.checkCancellation()
+    try grant.check()
+    guard let value = try? open(protection.verification, key: key, context: context),
+      value == Data("root-access".utf8)
+    else {
+      throw VaultError.incorrectRootPassword
+    }
+  }
+
   /// 业务作用：检查独立文本密码的工作量与有效内容，不沿用 App 数字或手势密码。
   /// 参数说明：
   /// - `password`：当前输入的目录独立文本密码，保持原字符不自动裁剪。

@@ -24,6 +24,7 @@ struct VaultLandingView: View {
   @State private var deletingSelection: [VaultMedia] = []
   @State private var renamingItem: VaultMedia?
   @State private var renamedItemName = ""
+  @State private var inspecting: VaultMedia?
   @State private var systemSaveMedia: VaultMedia?
   @State private var systemSaveAction = SystemSaveAction.export
   @State private var systemSaveWarning = false
@@ -60,24 +61,6 @@ struct VaultLandingView: View {
       } message: {
         Text(model.moveFailure ?? "")
       }
-      .alert(
-        "相册导入未完成",
-        isPresented: Binding(
-          get: {
-            model.photoImportFailure != nil
-          },
-          set: { presented in
-            if !presented {
-              model.photoImportFailure = nil
-            }
-          })
-      ) {
-        Button("确定", role: .cancel) {
-          model.photoImportFailure = nil
-        }
-      } message: {
-        Text(model.photoImportFailure ?? "原件已保留，请重试。")
-      }
       .onChange(of: model.savedSources.count + model.savedPhotos.count) { _, count in
         sourceConfirmation = count > 0
       }
@@ -93,6 +76,7 @@ struct VaultLandingView: View {
           deleting = nil
           deletingSelection = []
           renamingItem = nil
+          inspecting = nil
           renamedItemName = ""
           systemSaveWarning = false
           systemSaveMedia = nil
@@ -158,6 +142,10 @@ struct VaultLandingView: View {
           }
         }
         .onChange(of: scenePhase) { _, phase in
+          // 迁移配对的系统权限弹窗只进入 inactive；真正后台仍必须撤销连接和保险箱会话。
+          if phase == .inactive, model.migration != nil {
+            return
+          }
           if phase != .active, model.shouldLockWhenInactive {
             conceal()
           }
@@ -198,7 +186,14 @@ struct VaultLandingView: View {
       #else
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       #endif
-      .overlay(VaultWindowProtection(model: model).allowsHitTesting(false))
+      .overlay {
+        #if os(macOS)
+          VaultWindowProtection(model: model, allowsScreenshots: allowScreenshots)
+            .allowsHitTesting(false)
+        #else
+          VaultWindowProtection(model: model).allowsHitTesting(false)
+        #endif
+      }
       .sheet(
         isPresented: $changing,
         onDismiss: {
@@ -255,6 +250,59 @@ struct VaultLandingView: View {
       }
       .sheet(isPresented: $model.requestingTextEdit) {
         TextEditAuthentication(model: model)
+          .interactiveDismissDisabled(model.busy)
+      }
+      .sheet(item: $inspecting) { media in
+        VaultPropertiesView(model: model, media: media)
+      }
+      .sheet(
+        item: Binding(
+          get: { model.migration },
+          set: { value in
+            if value == nil {
+              model.endMigration()
+            }
+          })
+      ) { migration in
+        VaultMigrationView(coordinator: migration, model: model)
+          .interactiveDismissDisabled()
+      }
+      .confirmationDialog(
+        "清理未完成接收？",
+        isPresented: Binding(
+          get: { model.migrationCleanup != nil },
+          set: {
+            if !$0 {
+              model.cancelMigrationCleanup()
+            }
+          }),
+        titleVisibility: .visible
+      ) {
+        if let prompt = model.migrationCleanup {
+          Button("清理暂存", role: .destructive) {
+            model.clearIncomingMigrationStaging(prompt)
+          }
+        }
+        Button("取消", role: .cancel) {
+          model.cancelMigrationCleanup()
+        }
+      } message: {
+        Text(
+          "将清理 \(model.migrationCleanup?.report.taskIDs.count ?? 0) 批未入库接收暂存，约 \(ByteCountFormatter.string(fromByteCount: Int64(clamping: model.migrationCleanup?.report.byteCount ?? 0), countStyle: .file))。清理后这些任务需要重新传输，来源文件和已入库内容保留。"
+        )
+      }
+      .sheet(
+        item: Binding(
+          get: {
+            model.rootPrompt
+          },
+          set: { prompt in
+            if prompt == nil {
+              model.cancelRootPrompt()
+            }
+          })
+      ) { prompt in
+        RootPasswordPresentation(model: model, presentationID: prompt.id)
           .interactiveDismissDisabled(model.busy)
       }
       .sheet(
@@ -350,7 +398,7 @@ struct VaultLandingView: View {
         }
       }
       .alert(
-        renamingItem?.isFolder == true && renamingItem?.isDocument == false ? "重命名文件夹" : "重命名文件",
+        renamingItem?.isFolder == true && renamingItem?.isFilePackage == false ? "重命名文件夹" : "重命名文件",
         isPresented: Binding(
           get: {
             renamingItem != nil
@@ -365,7 +413,7 @@ struct VaultLandingView: View {
         TextField("新名称", text: $renamedItemName)
         Button("重命名") {
           if let media = renamingItem {
-            if media.isFolder && !media.isDocument {
+            if media.isFolder && !media.isFilePackage {
               model.renameFolder(media, to: renamedItemName)
             } else {
               model.renameFile(media, to: renamedItemName)
@@ -380,7 +428,7 @@ struct VaultLandingView: View {
           renamedItemName = ""
         }
       } message: {
-        if renamingItem?.isFolder == true && renamingItem?.isDocument == false {
+        if renamingItem?.isFolder == true && renamingItem?.isFilePackage == false {
           Text("只更改文件夹名称，内容和原密码保持不变。受保护文件夹需要验证独立密码。")
         } else {
           Text("请保留原扩展名。只更改文件名称，内容、格式和所在目录保持不变。")
@@ -442,7 +490,8 @@ struct VaultLandingView: View {
         Text("此操作不能撤销，将永久删除保险箱内所选项目及文件夹内容。包含密码保护目录时整批拒绝，请先取消相关保护。系统来源和已复制的副本不受影响。")
       }
       .confirmationDialog(
-        deleting?.isFolder == true ? "永久删除此文件夹及全部内容？" : "永久删除此加密文件？",
+        deleting?.isFolder == true && deleting?.isFilePackage != true
+          ? "永久删除此文件夹及全部内容？" : "永久删除此加密文件？",
         isPresented: Binding<Bool>(
           get: {
             deleting != nil
@@ -454,7 +503,10 @@ struct VaultLandingView: View {
           }
         )
       ) {
-        Button(deleting?.isFolder == true ? "删除保险箱内文件夹" : "删除保险箱内文件", role: .destructive) {
+        Button(
+          deleting?.isFolder == true && deleting?.isFilePackage != true ? "删除保险箱内文件夹" : "删除保险箱内文件",
+          role: .destructive
+        ) {
           if let media = deleting {
             model.delete(media)
           }
@@ -462,12 +514,15 @@ struct VaultLandingView: View {
         }
       } message: {
         Text(
-          deleting?.isFolder == true
+          deleting?.isFolder == true && deleting?.isFilePackage != true
             ? "此操作不能撤销，将永久删除文件夹及其中全部加密子项。目录树中仍有密码保护时不能删除，请先取消相关文件夹密码。来源原件和此前导出的副本不受影响。"
             : "此操作不能撤销。来源原件和此前导出的副本不受影响。")
       }
       .confirmationDialog(systemSaveAction.title, isPresented: $systemSaveWarning) {
-        Button("选择本地目录并\(systemSaveAction.rawValue)") {
+        Button(
+          systemSaveMedia?.photoAsset == nil
+            ? "选择本地目录并\(systemSaveAction.rawValue)" : "选择本地目录保存全部照片资源"
+        ) {
           chooseFiles(for: .systemDirectory)
         }
         if let media = systemSaveMedia, media.isImage || media.isVideo {
@@ -494,9 +549,11 @@ struct VaultLandingView: View {
         #endif
       } message: {
         Text(
-          systemSaveAction == .copy
-            ? "按原名生成未加密副本，保险箱内原件继续保留，密码保护不变。受保护目录每次复制需重新验证，文件夹包含全部内容。系统副本可能按系统设置同步或备份。"
-            : "按原名保存未加密副本，保险箱内原件继续保留。受保护内容需先取消目录密码。系统副本可能按系统设置同步或备份。"
+          systemSaveMedia?.photoAsset != nil
+            ? "选择系统照片会保存主图片或主视频；选择本地目录会完整保存全部原始及配套资源。保险箱内原件继续保留，保护规则保持不变。系统副本未加密，可能按系统设置同步或备份。"
+            : systemSaveAction == .copy
+              ? "按原名生成未加密副本，保险箱内原件继续保留，密码保护不变。受保护目录每次复制需重新验证，文件夹包含全部内容。系统副本可能按系统设置同步或备份。"
+              : "按原名保存未加密副本，保险箱内原件继续保留。受保护内容需先取消目录密码。系统副本可能按系统设置同步或备份。"
         )
       }
       .confirmationDialog("加密保存并复验完成", isPresented: $sourceConfirmation) {
@@ -512,7 +569,9 @@ struct VaultLandingView: View {
         #if os(macOS)
           Text("本地原件将直接删除，不进入废纸篓，无法通过废纸篓恢复；删除前会再次完整复验加密副本。系统照片仍受最近删除和 iCloud 同步规则管理。")
         #else
-          Text("只删除刚完成加密并完整复验的原件。系统照片可能保留最近删除，并按 iCloud 设置同步到其它设备。")
+          Text(
+            "申请必要的相册权限，完整保存照片、视频及配套资源并逐项复验后，再请求删除原件。未完整保存的项目保留。系统照片可能保留最近删除，并按 iCloud 设置同步到其它设备。"
+          )
         #endif
       }
   }
@@ -771,6 +830,10 @@ struct VaultLandingView: View {
           if !model.visibleItems.isEmpty {
             Text("\(model.visibleItems.count) 项").font(.caption2).foregroundStyle(.secondary)
           }
+          if model.rootEnabled {
+            Text("ROOT").font(.caption2.weight(.bold)).foregroundStyle(.orange)
+              .accessibilityLabel("ROOT 权限已开启")
+          }
         }
         Spacer()
         Button("选择") {
@@ -795,8 +858,25 @@ struct VaultLandingView: View {
           Button("从系统照片导入") {
             choosingPhotos = true
           }
+          Divider()
+          Button("从其它设备接收加密内容") {
+            model.beginMigration(.receive)
+          }
         }.disabled(model.busy)
         Menu("设置") {
+          Button(model.rootEnabled ? "关闭 ROOT 权限" : "开启 ROOT 权限") {
+            if model.rootEnabled {
+              model.disableRootAccess()
+            } else {
+              model.requestRootAccess()
+            }
+          }
+          if model.rootEnabled {
+            Button("修改 ROOT 权限密码") {
+              model.requestRootPasswordChange()
+            }
+          }
+          Divider()
           Button("修改密码或切换手势") {
             model.closeViewer()
             changing = true
@@ -814,6 +894,13 @@ struct VaultLandingView: View {
           #if os(macOS)
             Toggle("允许窗口截屏", isOn: $allowScreenshots)
           #endif
+          Button("清理未完成接收暂存") {
+            model.requestMigrationCleanup()
+          }
+          Divider()
+          Button(model.currentFolderID == nil ? "迁移复制保险箱" : "迁移复制当前文件夹") {
+            model.beginMigration(.send)
+          }
         }.disabled(model.busy)
       }
       Button("锁定") {
@@ -835,6 +922,12 @@ struct VaultLandingView: View {
         Text("已选 \(model.selectedItems.count) 项").font(.headline)
           .accessibilityIdentifier("多选数量")
         Spacer()
+        Button {
+          model.beginMigration(.send, media: model.selectedItems)
+        } label: {
+          Label("发送", systemImage: "paperplane")
+        }
+        .disabled(model.busy || model.selectedItems.isEmpty)
         Menu {
           Button("移动到文件夹") {
             presentMove(model.selectedItems, byPath: false)
@@ -864,6 +957,9 @@ struct VaultLandingView: View {
       }
       if !model.selectedItems.isEmpty && !model.canMoveSelection {
         Text("所选项目含密码保护文件夹，请先取消保护后再移动或删除。")
+          .font(.caption).foregroundStyle(.secondary)
+      } else if !model.selectedItems.isEmpty && !model.canDeleteSelection {
+        Text("所选项目受文件夹密码保护，不能删除；移动需重新验证来源文件夹密码。")
           .font(.caption).foregroundStyle(.secondary)
       }
     }
@@ -1067,15 +1163,15 @@ struct VaultLandingView: View {
   private func mediaActionItems(_ media: VaultMedia) -> [VaultMediaMenuItem] {
     var result: [VaultMediaMenuItem] = []
     let protected = model.containsProtectedFolder(media)
-    result.append(
-      VaultMediaMenuItem(
-        title: media.isFolder && !media.isDocument ? "重命名文件夹" : "重命名文件",
-        enabled: !model.busy && model.editingText == nil,
-        action: {
-          renamedItemName = media.originalFilename
-          renamingItem = media
-        }))
-    if media.isFolder && !media.isDocument {
+    if media.isFolder && !media.isFilePackage {
+      if model.rootEnabled {
+        result.append(
+          VaultMediaMenuItem(
+            title: media.isHidden ? "取消隐藏" : "设置隐藏", enabled: !model.busy,
+            action: {
+              model.setHidden(media, hidden: !media.isHidden)
+            }))
+      }
       result.append(
         VaultMediaMenuItem(
           title: media.folderPassword == nil ? "设置文件夹访问密码" : "取消文件夹访问密码",
@@ -1110,13 +1206,33 @@ struct VaultLandingView: View {
     }
     result.append(
       VaultMediaMenuItem(
-        title: "删除加密文件", destructive: true, enabled: !protected,
+        title: "删除加密文件", destructive: true, enabled: !model.exportRestricted(media),
         action: {
           deleting = media
         }))
-    if protected {
+    if model.exportRestricted(media) {
       result.append(VaultMediaMenuItem(title: "先取消文件夹密码后再删除"))
     }
+    result.append(
+      VaultMediaMenuItem(
+        title: "迁移复制到其它设备", enabled: !model.busy && model.editingText == nil,
+        action: {
+          model.beginMigration(.send, media: [media])
+        }))
+    result.append(
+      VaultMediaMenuItem(
+        title: "属性", enabled: !model.busy,
+        action: {
+          inspecting = media
+        }))
+    result.append(
+      VaultMediaMenuItem(
+        title: media.isFolder && !media.isFilePackage ? "重命名文件夹" : "重命名文件",
+        enabled: !model.busy && model.editingText == nil,
+        action: {
+          renamedItemName = media.originalFilename
+          renamingItem = media
+        }))
     return result
   }
 
@@ -1164,6 +1280,7 @@ struct VaultLandingView: View {
     eraseConfirmation = false
     sourceConfirmation = false
     deleting = nil
+    inspecting = nil
     systemSaveMedia = nil
     systemSaveWarning = false
     systemSaveAction = .export
@@ -1177,5 +1294,51 @@ struct VaultLandingView: View {
     password = ""
     eraseText = ""
     model.lock()
+  }
+}
+
+/// 仅展示当前授权文件的元数据，关闭或锁定后不保留属性快照。
+private struct VaultPropertiesView: View {
+  @ObservedObject var model: VaultModel
+  let media: VaultMedia
+  @Environment(\.dismiss) private var dismiss
+
+  /// 业务作用：为两端文件操作提供可滚动、可选择文本的只读属性页。
+  /// 参数说明：无。
+  /// 返回：当前条目的可见元数据和关闭入口；失去会话后不继续显示文件信息。
+  var body: some View {
+    let rows = model.properties(for: media)
+    VStack(alignment: .leading, spacing: 20) {
+      HStack {
+        Text("属性").font(.title2.weight(.semibold))
+        Spacer()
+        Button("完成") {
+          dismiss()
+        }
+        .keyboardShortcut(.defaultAction)
+      }
+      ScrollView {
+        VStack(alignment: .leading, spacing: 16) {
+          ForEach(rows.indices, id: \.self) { index in
+            VStack(alignment: .leading, spacing: 5) {
+              Text(rows[index].name).font(.caption).foregroundStyle(.secondary)
+              Text(rows[index].value)
+                .font(
+                  rows[index].name == "SHA-256" || rows[index].name.hasSuffix("标识")
+                    ? .system(.caption, design: .monospaced) : .body
+                )
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+          }
+        }
+      }
+    }
+    .padding(24)
+    .privacySensitive()
+    #if os(macOS)
+      .frame(width: 520, height: 620)
+    #endif
   }
 }

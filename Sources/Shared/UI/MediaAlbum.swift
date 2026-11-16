@@ -39,9 +39,10 @@ struct VaultMediaThumbnail: View {
   var body: some View {
     GeometryReader { geometry in
       ZStack {
-        if media.isFolder && !media.isDocument {
+        if media.isFolder && !media.isFilePackage {
           folder
             .padding(geometry.size.width * 0.08)
+            .opacity(media.isHidden ? 0.4 : 1)
         } else {
           Color.secondary.opacity(0.15)
           if let image {
@@ -82,7 +83,7 @@ struct VaultMediaThumbnail: View {
 
   /// 业务作用：用平台原生文件夹外观区分可进入目录，不读取目录外的任何文件或图标。
   /// 参数说明：无。
-  /// 返回：透明背景的系统文件夹标记；Pages 文件包由文档预览入口处理。
+  /// 返回：透明背景的系统文件夹标记，隐藏文件夹由外层以半透明显示；文档包由预览入口处理。
   private var folder: some View {
     Group {
       #if os(macOS)
@@ -94,7 +95,7 @@ struct VaultMediaThumbnail: View {
           .foregroundStyle(.blue.gradient)
       #endif
     }
-    .accessibilityLabel("文件夹")
+    .accessibilityLabel(media.isHidden ? "隐藏文件夹" : "文件夹")
     .accessibilityIdentifier("系统文件夹-" + media.originalFilename)
   }
 
@@ -184,7 +185,7 @@ private struct VaultAlbumCell: View {
 
   /// 业务作用：为卡片提供管理菜单与受限拖动，并给有效接收目录提供松手提示。
   /// 参数说明：无。
-  /// 返回：受保护来源不能拖走；受保护目标只在松手后呈现验证。
+  /// 返回：含密码保护的目录树不能拖走；文件来源及目标的保护密码在松手后验证。
   var body: some View {
     Group {
       #if os(iOS)
@@ -299,7 +300,7 @@ private struct VaultFolderDropDelegate: DropDelegate {
   func validateDrop(info: DropInfo) -> Bool {
     // 系统可能先协商目标再调用来源提供者，不能把尚未建立的令牌当作永久拒绝依据。
     info.hasItemsConforming(to: [vaultInternalDragType]) && model.screen == .library && !model.busy
-      && folder.isFolder && !folder.isDocument
+      && folder.isFolder && !folder.isFilePackage
   }
 
   /// 业务作用：进入有效目录时展示松手提示，不开始移动。
@@ -532,7 +533,7 @@ private struct VaultFolderDropDelegate: DropDelegate {
       /// 参数说明：
       /// - `interaction`：当前卡片的拖动交互。
       /// - `session`：系统发起的单指拖动会话。
-      /// 返回：允许移动时交付一个本地对象；受保护来源或失权时为空。
+      /// 返回：允许移动时交付一个本地对象；含密码保护的目录树或失权时为空。
       func dragInteraction(
         _ interaction: UIDragInteraction, itemsForBeginning session: any UIDragSession
       ) -> [UIDragItem] {
@@ -604,11 +605,11 @@ private struct VaultFolderDropDelegate: DropDelegate {
         -> Bool
       {
         session.localDragSession != nil && session.items.count == 1
-          && session.items.first?.localObject is Data && media.isFolder && !media.isDocument
+          && session.items.first?.localObject is Data && media.isFolder && !media.isFilePackage
           && model.screen == .library && !model.busy
       }
 
-      /// 业务作用：跟随手指更新有效目标高亮，并拒绝自身、重名与越过保护范围的目标。
+      /// 业务作用：跟随手指更新有效目标高亮，并拒绝自身、重名与违反目录保护范围的目标。
       /// 参数说明：
       /// - `interaction`：当前目标交互。
       /// - `session`：本次内部拖放。
@@ -633,7 +634,7 @@ private struct VaultFolderDropDelegate: DropDelegate {
         targeted.wrappedValue = false
       }
 
-      /// 业务作用：松手后同步消费本地令牌，再由统一移动入口验证目标密码。
+      /// 业务作用：松手后同步消费本地令牌，再由统一移动入口验证来源与目标密码。
       /// 参数说明：
       /// - `interaction`：明确接收本次释放的目标。
       /// - `session`：仅含本应用随机令牌的拖放会话。
@@ -729,6 +730,7 @@ struct VaultMediaBrowser<Actions: View>: View {
   @State private var stripVisible = true
   @State private var imageViewport = ImageViewport()
   @State private var footerHeight: CGFloat = 0
+  @State private var videoScrubPosition: Double?
 
   /// 业务作用：在同一查看区连续浏览图片与视频，使用浮动操作和可隐藏缩略图栏。
   /// 参数说明：无。
@@ -856,41 +858,67 @@ struct VaultMediaBrowser<Actions: View>: View {
     #endif
     .onChange(of: model.selected?.id) { _, _ in
       imageViewport = ImageViewport()
+      videoScrubPosition = nil
+    }
+    .onChange(of: model.screen) { _, value in
+      if value != .library {
+        videoScrubPosition = nil
+      }
+    }
+    .onChange(of: model.busy) { _, value in
+      if value {
+        videoScrubPosition = nil
+      }
     }
     .onChange(of: fullScreen) { _, value in
       chromeVisible = !value
+      videoScrubPosition = nil
+    }
+    .onDisappear {
+      videoScrubPosition = nil
     }
     .privacySensitive()
   }
 
-  /// 业务作用：保持当前原生视频层或当前图片占满可用查看区，滑动只作用于画面。
+  /// 业务作用：保持当前媒体占满查看区，两端视频横向拖动定位，图片横向拖动切换媒体。
   /// 参数说明：无。
-  /// 返回：当前媒体、短暂预览或失败提示，不把工具栏的滑动误当作翻页。
+  /// 返回：当前媒体、短暂预览或失败提示，工具栏手势不触发画面操作。
   private var mediaSurface: some View {
     Group {
       if let media = model.selected {
         if media.isVideo, let playback = model.playback {
-          PlayerSurface(playback: playback)
-            .contentShape(Rectangle())
-            .simultaneousGesture(
-              DragGesture().onEnded { value in
-                if let step = MediaSwipe.step(for: value.translation) {
-                  navigate(step)
-                }
+          PlayerSurface(
+            playback: playback,
+            scrubbingEnabled: model.screen == .library && !model.busy,
+            onScrub: { position in
+              guard model.playback === playback, model.screen == .library, !model.busy else {
+                videoScrubPosition = nil
+                return
               }
-            )
-            .simultaneousGesture(
-              SpatialTapGesture(count: 2).exclusively(before: SpatialTapGesture()).onEnded {
-                value in
-                switch value {
-                case .first:
-                  toggleFullScreen()
-                case .second:
-                  chromeVisible.toggle()
-                }
+              videoScrubPosition = position
+              if position != nil {
+                chromeVisible = true
               }
-            )
-            .accessibilityLabel("视频预览")
+            }
+          )
+          .contentShape(Rectangle())
+          .simultaneousGesture(
+            SpatialTapGesture(count: 2).exclusively(before: SpatialTapGesture()).onEnded {
+              value in
+              switch value {
+              case .first:
+                toggleFullScreen()
+              case .second:
+                chromeVisible.toggle()
+              }
+            }
+          )
+          .accessibilityLabel("视频预览")
+          #if os(iOS)
+            .accessibilityHint("单指左滑后退，右滑前进")
+          #else
+            .accessibilityHint("按住鼠标左键向左拖动后退，向右拖动前进")
+          #endif
         } else if !media.isVideo, let image = model.image {
           VaultImageViewer(
             image: image, viewport: $imageViewport, showsControls: false,
@@ -997,7 +1025,7 @@ struct VaultMediaBrowser<Actions: View>: View {
       if let playback = model.playback {
         VaultPlayerControls(
           playback: playback, fullScreen: fullScreen, toggleFullScreen: toggleFullScreen,
-          rotateVideo: rotateVideo)
+          rotateVideo: rotateVideo, previewPosition: videoScrubPosition)
       } else if let image = model.image {
         HStack(spacing: 4) {
           VaultImageControls(viewport: $imageViewport, imageSize: image.size, viewportSize: size)

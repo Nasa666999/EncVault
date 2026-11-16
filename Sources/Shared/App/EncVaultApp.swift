@@ -67,7 +67,7 @@ struct EncVaultApp: App {
   ///
   /// 返回：从首次设置或锁定界面开始，不自动恢复上次媒体。
   var body: some Scene {
-    WindowGroup {
+    WindowGroup(id: "vault") {
       VaultLandingView(model: model)
         #if os(macOS)
           .onAppear {

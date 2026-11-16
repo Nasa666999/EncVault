@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>仅在你主动迁移复制时发现并连接附近的 EncVault，传输加密内容。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_encvault._tcp</string>
+    </array>
+    <key>NSCameraUsageDescription</key>
+    <string>仅在你选择扫码配对时识别另一台设备的 EncVault 二维码，不拍照或录制。</string>
+</dict>
+</plist>

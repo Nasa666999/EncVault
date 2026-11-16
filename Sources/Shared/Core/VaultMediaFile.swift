@@ -15,10 +15,18 @@ struct MediaIdentity: Codable, Sendable {
   let noncePrefix: Data
 }
 
-private struct MediaHeader: Codable, Sendable {
+struct MediaHeader: Codable, Sendable {
   let identity: MediaIdentity
   let wrappedKey: Data
   let metadata: Data
+}
+
+/// 完整照片资源清单只记录原始角色与相对路径，不包含相册资产身份或查看历史。
+private struct PhotoAssetResourceEntry: Decodable {
+  let resourceType: Int
+  let originalFilename: String
+  let uniformTypeIdentifier: String
+  let path: String
 }
 
 /// 来源句柄的稳定身份，仅在本次保存及可选移除原件的会话内使用。
@@ -67,16 +75,21 @@ final class VaultMediaReader: @unchecked Sendable {
   let grant: VaultGrant
   let media: VaultMedia
   let folderRequirements: [UUID: UUID]
+  let rootToken: UUID?
 
   /// 业务作用：有界解析密文头并认证原始文件名，只有当前保险箱会话可以取得媒体信息。
   /// 参数说明：
   /// - `url`：保险箱中的密文文件。
   /// - `grant`：当前独立密码授权的会话。
   /// - `folderRequirements`：本次读取需持续有效的目录密码授权。
+  /// - `rootToken`：隐藏目录读取所绑定的本次 ROOT 激活身份。
   /// 返回：已经认证元数据的读取器；身份、长度、格式或密钥错误时失败。
-  init(url: URL, grant: VaultGrant, folderRequirements: [UUID: UUID] = [:]) throws {
+  init(
+    url: URL, grant: VaultGrant, folderRequirements: [UUID: UUID] = [:], rootToken: UUID? = nil
+  ) throws {
     self.grant = grant
     self.folderRequirements = folderRequirements
+    self.rootToken = rootToken
     let file = try FileHandle(forReadingFrom: url)
     self.file = file
     guard try VaultStorage.read(file, count: 8) == Self.magic else {
@@ -108,7 +121,8 @@ final class VaultMediaReader: @unchecked Sendable {
       throw VaultError.corrupt
     }
     let context = try VaultCrypto.encode(identity)
-    let decoded: VaultMedia = try grant.access(folders: folderRequirements) { root in
+    let decoded: VaultMedia = try grant.access(folders: folderRequirements, rootToken: rootToken) {
+      root in
       let key = try VaultCrypto.open(
         parsed.wrappedKey, key: SymmetricKey(data: root), context: context)
       guard key.count == 32 else {
@@ -128,9 +142,22 @@ final class VaultMediaReader: @unchecked Sendable {
       throw VaultError.corrupt
     }
     if let protection = decoded.folderPassword {
-      guard decoded.isFolder, !decoded.isDocument, protection.salt.count == 16,
+      guard decoded.isFolder, !decoded.isFilePackage, protection.salt.count == 16,
         protection.iterations >= VaultCrypto.rounds, protection.iterations <= 3_000_000,
         protection.verification.count == 44
+      else {
+        throw VaultError.corrupt
+      }
+    }
+    if let asset = decoded.photoAsset {
+      guard decoded.isFolder, decoded.byteCount == 0, decoded.folderPassword == nil,
+        decoded.hidden != true, asset.primaryID != decoded.id, asset.manifestID != decoded.id,
+        asset.primaryID != asset.manifestID,
+        asset.byteCount > 0, asset.sha256.count == 32,
+        asset.totalByteCount >= asset.byteCount, asset.resourceCount > 0,
+        asset.resourceCount <= 4096,
+        UTType(asset.contentType)?.conforms(to: .image) == true
+          || UTType(asset.contentType)?.conforms(to: .movie) == true
       else {
         throw VaultError.corrupt
       }
@@ -168,7 +195,7 @@ final class VaultMediaReader: @unchecked Sendable {
     }
     // 每次读取结束即释放 Foundation 的临时密文与解密对象，长期播放或完整复验不能累积所有块。
     return try autoreleasepool {
-      try grant.access(folders: folderRequirements) { root in
+      try grant.access(folders: folderRequirements, rootToken: rootToken) { root in
         let identity = header.identity
         let context = try VaultCrypto.encode(identity)
         let key = try VaultCrypto.open(
@@ -249,7 +276,7 @@ final class VaultMediaReader: @unchecked Sendable {
   /// 参数说明：无。
   /// 返回：所有能力仍有效时成功；App 锁定或目录授权撤销后拒绝。
   func checkAccess() throws {
-    try grant.access(folders: folderRequirements) { _ in
+    try grant.access(folders: folderRequirements, rootToken: rootToken) { _ in
       ()
     }
   }
@@ -357,6 +384,71 @@ final class VaultCopySession: @unchecked Sendable {
   }
 }
 
+/// 一批来源文件的单次移动证明，与当前浏览权限独立。
+final class VaultMoveSession: @unchecked Sendable {
+  let mediaIDs: [UUID]
+  private let owner: VaultLibrary
+  private let parent: VaultGrant
+  private let grant: VaultGrant
+  private let mutex = NSLock()
+  private var available = true
+
+  /// 业务作用：为明确选择的移动来源建立没有旧目录证明的临时能力。
+  /// 参数说明：
+  /// - `mediaIDs`：本次批次唯一允许移动的来源身份。
+  /// - `owner`：创建本次移动的保险箱入口。
+  /// - `parent`：本次仍有效的 App 会话。
+  /// 返回：依赖 App 会话的内存能力，不继承浏览时输入的密码。
+  fileprivate init(mediaIDs: [UUID], owner: VaultLibrary, parent: VaultGrant) throws {
+    self.mediaIDs = mediaIDs
+    self.owner = owner
+    self.parent = parent
+    grant = try parent.access { root in
+      VaultGrant(root: root, vaultID: parent.vaultID, parent: parent)
+    }
+  }
+
+  /// 业务作用：核对移动证明的归属，并在实际移动前一次性消费证明。
+  /// 参数说明：
+  /// - `owner`：执行本次移动的同一保险箱入口。
+  /// - `parent`：创建本次证明的同一 App 会话。
+  /// - `consume`：开始移动时为真，目录验证时为假。
+  /// 返回：归属一致且尚未消费时交付临时能力；错配、取消或重放时拒绝。
+  fileprivate func permission(
+    owner: VaultLibrary, parent: VaultGrant, consume: Bool = false
+  ) throws -> VaultGrant {
+    mutex.lock()
+    defer {
+      mutex.unlock()
+    }
+    // 目录证明只属于一次明确移动，不能转给其它来源或后来重新建立的会话。
+    guard available, self.owner === owner, self.parent === parent else {
+      throw VaultError.locked
+    }
+    if consume {
+      available = false
+    }
+    return grant
+  }
+
+  /// 业务作用：结束或取消移动时清除本次目录证明，不撤销当前浏览权限。
+  /// 参数说明：无。
+  /// 返回：该证明不能再验证密码或开始移动。
+  func revoke() {
+    mutex.lock()
+    available = false
+    mutex.unlock()
+    grant.revoke()
+  }
+
+  /// 业务作用：释放移动请求时清除未消费的临时权限。
+  /// 参数说明：无。
+  /// 返回：不保留可供后续移动复用的密码证明。
+  deinit {
+    revoke()
+  }
+}
+
 /// 批量移动只返回会话与完成情况，不持有文件内容或密码原文。
 struct VaultBatchMoveResult: Sendable {
   let grant: VaultGrant
@@ -367,8 +459,8 @@ struct VaultBatchMoveResult: Sendable {
 
 /// 加密媒体目录，不创建播放历史、明文索引或明文缩略图。
 final class VaultLibrary: @unchecked Sendable {
-  private let store: VaultStore
-  private let mutation = NSRecursiveLock()
+  let store: VaultStore
+  let mutation = NSRecursiveLock()
 
   /// 业务作用：把媒体事务限定到指定保险箱的私有目录。
   /// 参数说明：
@@ -378,24 +470,57 @@ final class VaultLibrary: @unchecked Sendable {
     self.store = store
   }
 
-  /// 业务作用：只枚举当前 App 和目录授权允许看到的原名，不展示未验证目录的内部文件。
+  /// 业务作用：枚举当前授权可见条目，识别完整照片资源包，不展示照片内部资源或未授权文件。
   /// 参数说明：
   /// - `grant`：当前前台会话能力。
-  /// 返回：按原名和随机身份稳定排序的媒体；任一密文头损坏时明确失败，不静默吞掉数据。
+  /// 返回：照片呈现转换保留全部资源与身份；可见媒体按原名排序，任一密文头损坏时明确失败。
   func list(using grant: VaultGrant) throws -> [VaultMedia] {
-    let entries = try allEntries(using: grant)
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    var entries = try allEntries(using: grant)
+    for position in entries.indices {
+      let item = entries[position]
+      if item.photoAsset == nil, item.isFolder,
+        item.originalFilename.hasSuffix("（完整照片资源）")
+          || item.originalFilename.hasSuffix("（实况照片）")
+          || item.originalFilename.hasSuffix("（完整资源）")
+      {
+        do {
+          entries[position] = try completePhotoAsset(id: item.id, using: grant)
+        } catch VaultError.folderPasswordRequired {
+          continue
+        } catch VaultError.rootRequired {
+          continue
+        }
+      }
+    }
     let index = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
     return try entries.filter { media in
-      let requirements = try folderRequirements(
-        for: media, includingSelf: false, entries: index, using: grant)
       do {
-        try grant.access(folders: requirements) { _ in
+        let path = try folderChain(for: media, includingSelf: true, entries: index, using: grant)
+        // 配套资源仅作为所属照片的内部内容，不出现在相册、普通文件列表或移动目标中。
+        guard !path.contains(where: { $0.id != media.id && $0.photoAsset != nil }) else {
+          return false
+        }
+        let token = try rootRequirement(in: path, using: grant)
+        let requirements = try folderRequirements(
+          for: media, includingSelf: false, entries: index, using: grant)
+        try grant.access(folders: requirements, rootToken: token) { _ in
           ()
         }
         return true
       } catch VaultError.folderPasswordRequired {
         return false
+      } catch VaultError.rootRequired {
+        return false
       }
+    }.sorted {
+      if $0.originalFilename == $1.originalFilename {
+        return $0.id.uuidString < $1.id.uuidString
+      }
+      return $0.originalFilename < $1.originalFilename
     }
   }
 
@@ -405,6 +530,8 @@ final class VaultLibrary: @unchecked Sendable {
   /// 返回：完整认证并稳定排序的内部目录，任何损坏均明确拒绝。
   private func allEntries(using grant: VaultGrant) throws -> [VaultMedia] {
     try store.authorize(grant)
+    // 媒体进入普通列表前先完成遗留迁移事务的提交判定或精确撤回，不能显示半份接收目录。
+    try VaultMigrationStorage.recover(store, using: grant)
     let urls = try FileManager.default.contentsOfDirectory(
       at: store.mediaDirectory, includingPropertiesForKeys: nil)
     let items = try urls.filter {
@@ -419,6 +546,8 @@ final class VaultLibrary: @unchecked Sendable {
         return media
       }
     }
+    try VaultMigrationStorage.discardOrphanedIncoming(
+      store, liveIDs: Set(items.map(\.id)), using: grant)
     try grant.check()
     return items.sorted {
       if $0.originalFilename == $1.originalFilename {
@@ -426,6 +555,14 @@ final class VaultLibrary: @unchecked Sendable {
       }
       return $0.originalFilename < $1.originalFilename
     }
+  }
+
+  /// 业务作用：为密文迁移取得完整认证目录，访问范围由迁移事务另行按 ROOT 与祖先关系收紧。
+  /// 参数说明：
+  /// - `grant`：当前保险箱会话，不授予迁移以外的新能力。
+  /// 返回：仅供内部规划的条目，不直接向未授权界面或网络交付原目录验证材料。
+  func migrationEntries(using grant: VaultGrant) throws -> [VaultMedia] {
+    try allEntries(using: grant)
   }
 
   /// 业务作用：为选中的密文创建受会话约束的随机读取入口，不把原名暴露为外部文档 URL。
@@ -441,9 +578,132 @@ final class VaultLibrary: @unchecked Sendable {
     try store.authorize(grant)
     let metadata = try rawReader(id: id, using: grant).media
     let requirements = try folderRequirements(for: metadata, includingSelf: true, using: grant)
+    let token = try rootRequirement(
+      in: folderChain(for: metadata, includingSelf: true, using: grant), using: grant)
     return try VaultMediaReader(
       url: store.mediaDirectory.appendingPathComponent(id.uuidString + ".evm"), grant: grant,
-      folderRequirements: requirements)
+      folderRequirements: requirements, rootToken: token)
+  }
+
+  /// 业务作用：为照片缩略图和播放取得主图或主视频，配套资源继续保留在同一照片内部。
+  /// 参数说明：
+  /// - `id`：当前选择的照片、视频或普通媒体身份。
+  /// - `grant`：当前目录及 ROOT 状态均有效的会话。
+  /// 返回：普通媒体直接返回自身，照片包只返回经过目录归属与摘要核对的主资源读取器。
+  func presentationReader(id: UUID, using grant: VaultGrant) throws -> VaultMediaReader {
+    let root = try reader(id: id, using: grant)
+    guard let asset = root.media.photoAsset else {
+      return root
+    }
+    let entries = try photoAssetContents(id: id, using: grant)
+    let files = entries.filter { !$0.isFolder }
+    guard let primary = files.first(where: { $0.id == asset.primaryID }),
+      files.contains(where: { $0.id == asset.manifestID }),
+      files.count == asset.resourceCount + 1,
+      primary.contentType == asset.contentType, primary.byteCount == asset.byteCount,
+      primary.sha256 == asset.sha256
+    else {
+      throw VaultError.corrupt
+    }
+    return try reader(id: primary.id, using: grant)
+  }
+
+  /// 业务作用：在完整照片导出和主资源复验时取得内部资源，不把它们发布为普通相册条目。
+  /// 参数说明：
+  /// - `id`：已认证照片包身份。
+  /// - `grant`：拥有该照片及全部祖先目录访问权的会话。
+  /// 返回：根条目在前的全部内部资源；缺失、越界或失权时拒绝。
+  func photoAssetContents(id: UUID, using grant: VaultGrant) throws -> [VaultMedia] {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    let root = try reader(id: id, using: grant).media
+    guard root.photoAsset != nil else {
+      throw VaultError.invalidSelection
+    }
+    return try descendants(of: root, using: grant)
+  }
+
+  /// 业务作用：将完整资源归为单个照片条目，并兼容此前已保存的资源目录，不删除任何配套内容。
+  /// 参数说明：
+  /// - `id`：本应用保存的完整照片资源目录身份。
+  /// - `grant`：当前已验证的目录会话，保持原有权限不变。
+  /// 返回：资源清单、层级和主图均成立时发布照片展示元数据；非照片目录保持原样。
+  func completePhotoAsset(id: UUID, using grant: VaultGrant) throws -> VaultMedia {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    let original = try reader(id: id, using: grant).media
+    guard original.isFolder, original.photoAsset == nil, !original.isDocument,
+      original.folderPassword == nil, !original.isHidden
+    else {
+      return original
+    }
+    let entries = try descendants(of: original, using: grant)
+    guard !entries.contains(where: { $0.folderPassword != nil || $0.isHidden }),
+      let manifest = entries.first(where: {
+        $0.parentID == id && !$0.isFolder && $0.originalFilename == "资源清单.json"
+      }), manifest.byteCount > 0, manifest.byteCount <= 1024 * 1024
+    else {
+      return original
+    }
+    let data = try reader(id: manifest.id, using: grant).imageData(limit: 1024 * 1024)
+    guard let records = try? JSONDecoder().decode([PhotoAssetResourceEntry].self, from: data),
+      !records.isEmpty, records.count <= 4096,
+      entries.filter({ !$0.isFolder }).count == records.count + 1
+    else {
+      return original
+    }
+    var resources: [(role: Int, media: VaultMedia)] = []
+    var visited: Set<UUID> = []
+    for record in records {
+      let parts = record.path.split(separator: "/", omittingEmptySubsequences: false).map(
+        String.init)
+      guard parts.count == 2, !parts.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }),
+        let directory = entries.first(where: {
+          $0.parentID == id && $0.isFolder && $0.originalFilename == parts[0]
+        }),
+        let file = entries.first(where: {
+          $0.parentID == directory.id && !$0.isFolder && $0.originalFilename == parts[1]
+        }), visited.insert(file.id).inserted
+      else {
+        return original
+      }
+      resources.append((record.resourceType, file))
+    }
+    let priority = [5, 4, 1, 6, 2]
+    guard
+      let primary = priority.lazy.compactMap({ role in
+        resources.first(where: { $0.role == role && ($0.media.isImage || $0.media.isVideo) })?.media
+      }).first
+    else {
+      return original
+    }
+    var total: UInt64 = 0
+    for resource in resources {
+      let addition = total.addingReportingOverflow(resource.media.byteCount)
+      guard !addition.overflow else {
+        throw VaultError.unsupportedMedia
+      }
+      total = addition.partialValue
+    }
+    let asset = VaultPhotoAsset(
+      primaryID: primary.id, contentType: primary.contentType, byteCount: primary.byteCount,
+      sha256: primary.sha256, totalByteCount: total, resourceCount: resources.count,
+      manifestID: manifest.id)
+    let updated = VaultMedia(
+      id: original.id, originalFilename: primary.originalFilename,
+      contentType: original.contentType,
+      byteCount: original.byteCount, sha256: original.sha256, parentID: original.parentID,
+      folderPassword: original.folderPassword, hidden: original.hidden, photoAsset: asset)
+    let requirements = try folderRequirements(for: original, includingSelf: true, using: grant)
+    // 只改变零载荷目录的照片呈现方式，全部子项及保护策略保持原样，不撤销当前导入所用的目录授权。
+    _ = try publishMetadata(
+      updated, replacing: original, requirements: requirements, using: grant,
+      uncertain: .organizationCommitUncertain, retainingSession: true)
+    return updated
   }
 
   /// 业务作用：仅读取认证元数据以定位目录门禁，不提供绕过密码的载荷读取入口。
@@ -498,17 +758,40 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `includingSelf`：是否包含目标目录自身。
   /// - `entries`：可选认证元数据快照。
   /// - `grant`：当前 App 会话。
-  /// 返回：受保护目录身份与密码代次，不包含密码或访问历史。
+  /// 返回：受保护目录身份与密码代次；涉及隐藏路径时要求 ROOT 已开启，不包含密码或访问历史。
   private func folderRequirements(
     for media: VaultMedia, includingSelf: Bool, entries: [UUID: VaultMedia]? = nil,
     using grant: VaultGrant
   ) throws -> [UUID: UUID] {
     let path = try folderChain(
       for: media, includingSelf: includingSelf, entries: entries, using: grant)
+    _ = try rootRequirement(in: path, using: grant)
     return Dictionary(
       uniqueKeysWithValues: path.compactMap { folder in
         folder.folderPassword.map { (folder.id, $0.revision) }
       })
+  }
+
+  /// 业务作用：将隐藏目录及其后代的访问绑定到本次 ROOT 激活，不把普通 App 解锁当作授权。
+  /// 参数说明：
+  /// - `path`：已经认证的目录路径，包含当前操作需要访问的目录。
+  /// - `grant`：当前 App 会话或依赖它的临时能力。
+  /// 返回：路径涉及隐藏文件夹时交付有效 ROOT 身份，普通路径为空；未开启 ROOT 时拒绝。
+  private func rootRequirement(in path: [VaultMedia], using grant: VaultGrant) throws -> UUID? {
+    guard
+      path.contains(where: {
+        $0.isHidden
+      })
+    else {
+      return nil
+    }
+    guard let token = try grant.rootToken() else {
+      throw VaultError.rootRequired
+    }
+    try grant.access(rootToken: token) { _ in
+      ()
+    }
+    return token
   }
 
   /// 业务作用：操作开始前按外层优先找出尚未验证的目录，导出和删除不能绕过内部保护。
@@ -527,7 +810,9 @@ final class VaultLibrary: @unchecked Sendable {
     let candidates =
       recursive && media.isFolder ? try descendantEntries(of: media, using: grant) : [media]
     for candidate in candidates {
-      for folder in try folderChain(for: candidate, includingSelf: true, using: grant) {
+      let path = try folderChain(for: candidate, includingSelf: true, using: grant)
+      _ = try rootRequirement(in: path, using: grant)
+      for folder in path {
         if let password = folder.folderPassword {
           do {
             try grant.access(folders: [folder.id: password.revision]) { _ in
@@ -559,7 +844,7 @@ final class VaultLibrary: @unchecked Sendable {
     try grant.access(folders: parents) { _ in
       ()
     }
-    guard folder.isFolder, !folder.isDocument, let protection = folder.folderPassword else {
+    guard folder.isFolder, !folder.isFilePackage, let protection = folder.folderPassword else {
       throw VaultError.invalidFolder
     }
     try VaultCrypto.verifyFolderPassword(
@@ -601,7 +886,7 @@ final class VaultLibrary: @unchecked Sendable {
     }
     try store.authorize(grant)
     let original = try rawReader(id: id, using: grant).media
-    guard original.isFolder, !original.isDocument else {
+    guard original.isFolder, !original.isFilePackage else {
       throw VaultError.invalidFolder
     }
     let parents = try folderRequirements(for: original, includingSelf: false, using: grant)
@@ -628,11 +913,48 @@ final class VaultLibrary: @unchecked Sendable {
     let media = VaultMedia(
       id: original.id, originalFilename: original.originalFilename,
       contentType: original.contentType,
-      byteCount: 0, sha256: original.sha256, parentID: original.parentID, folderPassword: protection
+      byteCount: 0, sha256: original.sha256, parentID: original.parentID,
+      folderPassword: protection,
+      hidden: original.hidden
     )
     return try publishMetadata(
       media, replacing: original, requirements: parents, using: grant,
       uncertain: .folderCommitUncertain)
+  }
+
+  /// 业务作用：仅在 ROOT 已验证开启时更改普通文件夹隐藏状态，保留独立目录密码与全部内容。
+  /// 参数说明：
+  /// - `id`：当前明确选择的普通文件夹，不接受文件或文档包。
+  /// - `hidden`：设为隐藏或取消隐藏。
+  /// - `grant`：拥有当前父目录访问权且已开启 ROOT 的 App 会话。
+  /// 返回：完整发布后交付保留 ROOT 及父目录授权的新会话；拒绝或发布前失败时保持原状态。
+  func setHidden(id: UUID, hidden: Bool, using grant: VaultGrant) throws -> VaultGrant {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    try store.authorize(grant)
+    guard let token = try grant.rootToken() else {
+      throw VaultError.rootRequired
+    }
+    try grant.access(rootToken: token) { _ in
+      ()
+    }
+    let original = try rawReader(id: id, using: grant).media
+    guard original.isFolder, !original.isFilePackage else {
+      throw VaultError.invalidSelection
+    }
+    let parents = try folderRequirements(for: original, includingSelf: false, using: grant)
+    var media = original
+    media.hidden = hidden ? true : nil
+    // ROOT 仅授权可见性管理，不读取目录载荷或取消目录密码；父目录仍必须已经授权。
+    let replacement = try publishMetadata(
+      media, replacing: original, requirements: parents, using: grant,
+      uncertain: .organizationCommitUncertain)
+    for (folderID, revision) in parents {
+      try replacement.allowFolder(folderID, revision: revision)
+    }
+    return replacement
   }
 
   /// 业务作用：有界重新封装名称或保护元数据并原子发布，保持原始内容与目录子项不变。
@@ -642,16 +964,25 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `requirements`：提交期间必须保持有效的目录授权。
   /// - `grant`：当前 App 会话。
   /// - `uncertain`：撤销旧会话后无法确认提交时向界面交付的保护态原因。
-  /// 返回：完整校验并发布后返回新会话；发布前失败保留原件，发布结果不明时锁定。
+  /// - `retainingSession`：仅照片呈现转换保持当前会话，禁止用于改变目录保护或父子关系。
+  /// 返回：完整校验后交付新会话，照片呈现转换沿用当前会话；发布前失败保留原件，发布不明时锁定。
   private func publishMetadata(
     _ media: VaultMedia, replacing original: VaultMedia, requirements: [UUID: UUID],
-    using grant: VaultGrant, uncertain: VaultError
+    using grant: VaultGrant, uncertain: VaultError, retainingSession: Bool = false
   ) throws -> VaultGrant {
     let id = original.id
     guard media.id == id, media.byteCount == original.byteCount,
       media.sha256 == original.sha256
     else {
       throw VaultError.corrupt
+    }
+    if retainingSession {
+      guard original.isFolder, media.isFolder, media.photoAsset != nil,
+        original.parentID == media.parentID, original.folderPassword == media.folderPassword,
+        original.hidden == media.hidden, original.folderPassword == nil, !original.isHidden
+      else {
+        throw VaultError.invalidSelection
+      }
     }
     let destination = store.mediaDirectory.appendingPathComponent(id.uuidString + ".evm")
     let input = try VaultMediaReader(
@@ -722,8 +1053,13 @@ final class VaultLibrary: @unchecked Sendable {
     guard try rawReader(id: id, using: grant).media == original else {
       throw VaultError.documentChanged
     }
-    // 新密文完整校验后先撤销旧能力，再发布元数据，旧读者不能继续交付过期策略或名称。
-    let replacement = try store.rotateSession(using: grant, folders: requirements)
+    // 用户改名或保护变化先撤销旧能力；零载荷照片呈现转换不改变权限或内容，沿用本次已验证会话。
+    let replacement: VaultGrant
+    if retainingSession {
+      replacement = grant
+    } else {
+      replacement = try store.rotateSession(using: grant, folders: requirements)
+    }
     do {
       try replacement.access { _ in
         try Task.checkCancellation()
@@ -744,20 +1080,41 @@ final class VaultLibrary: @unchecked Sendable {
   /// 参数说明：
   /// - `source`：用户授权的本地普通文件，媒体与其它文件均保持原始字节。
   /// - `originalName`：系统交付临时文件时对应的原名；普通本地文件为空。
+  /// - `parentID`：当前已授权的接收目录；为空时保存到保险箱根目录。
   /// - `grant`：当前独立密码授权的会话。
   /// - `status`：当前文件的阶段、字节进度和已完成计数，仅在本次内存中交付。
   /// - `progress`：仅在当前界面使用的进度，不落盘。
   /// 返回：保存完整的媒体与来源身份；失败或失权时保留来源，不发布部分文件。
   func save(
-    source: URL, originalName: String? = nil, using grant: VaultGrant,
+    source: URL, originalName: String? = nil, in parentID: UUID? = nil, using grant: VaultGrant,
     status: @escaping @Sendable (ImportProgress) -> Void = { _ in },
     progress: @escaping @Sendable (Double) -> Void = { _ in }
   ) throws -> SavedImport {
-    try autoreleasepool {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    try validateImportDestination(parentID, using: grant)
+    return try autoreleasepool {
       try saveEntry(
-        source: source, name: originalName ?? source.lastPathComponent, parentID: nil,
+        source: source, name: originalName ?? source.lastPathComponent, parentID: parentID,
         directoryEntry: false,
         using: grant, status: status, progress: progress)
+    }
+  }
+
+  /// 业务作用：确认用户选择的导入位置仍是已授权普通目录，不把文档包内部当作接收位置。
+  /// 参数说明：
+  /// - `parentID`：导入开始时的目录身份；为空时使用保险箱根目录。
+  /// - `grant`：当前浏览会话，复用进入目录时已有的权限。
+  /// 返回：位置及权限有效时成功；失效、失权或文档包目标时拒绝，不回退到根目录。
+  private func validateImportDestination(_ parentID: UUID?, using grant: VaultGrant) throws {
+    try store.authorize(grant)
+    if let parentID {
+      let parent = try reader(id: parentID, using: grant).media
+      guard parent.isFolder, !parent.isFilePackage else {
+        throw VaultError.invalidFolder
+      }
     }
   }
 
@@ -789,7 +1146,7 @@ final class VaultLibrary: @unchecked Sendable {
     let media = VaultMedia(
       id: original.id, originalFilename: original.originalFilename,
       contentType: original.contentType, byteCount: size, sha256: Data(SHA256.hash(data: data)),
-      parentID: original.parentID)
+      parentID: original.parentID, hidden: original.hidden)
     // 每次保存使用新的文件密钥与 nonce 前缀，不能在同一密钥下重用旧分块的 nonce。
     let fileKey = try VaultCrypto.random(32)
     let context = try VaultCrypto.encode(identity)
@@ -879,11 +1236,16 @@ final class VaultLibrary: @unchecked Sendable {
       mutation.unlock()
     }
     try store.authorize(grant)
-    let directoryRequirements =
+    let directoryRequirements: [UUID: UUID] =
       try parentID.map { parentID in
-        try folderRequirements(
-          for: rawReader(id: parentID, using: grant).media, includingSelf: true, using: grant)
+        let parent = try rawReader(id: parentID, using: grant).media
+        // 内部层级必须仍是目录；文档包的子项也通过此入口保留完整结构。
+        guard parent.isFolder else {
+          throw VaultError.invalidFolder
+        }
+        return try folderRequirements(for: parent, includingSelf: true, using: grant)
       } ?? [:]
+    // 导入复用进入目录时取得的权限，不再次索取密码；离开路径或锁定后失权即停止写入。
     try grant.access(folders: directoryRequirements) { _ in
       ()
     }
@@ -1041,12 +1403,13 @@ final class VaultLibrary: @unchecked Sendable {
   /// 业务作用：边遍历边逐文件提交目录，保留层级、空目录与原名，不预装全部来源路径。
   /// 参数说明：
   /// - `source`：用户通过系统选择器授权的本地目录。
+  /// - `parentID`：当前已授权的接收目录；来源目录作为其子目录保存，空值表示保险箱根目录。
   /// - `grant`：当前独立密码会话。
   /// - `status`：当前条目的阶段、字节进度及累计完成数量，不建立持久化来源清单。
   /// - `progress`：当前文件内的进度，目录未知总量时不表示整个目录的百分比。
   /// 返回：已建立的根目录、完整文件收据与失败数量；失败或中断保留来源，已完成条目仍可解锁读取。
   func saveFolder(
-    source: URL, using grant: VaultGrant,
+    source: URL, in parentID: UUID? = nil, using grant: VaultGrant,
     status: @escaping @Sendable (ImportProgress) -> Void = { _ in },
     progress: @escaping @Sendable (Double) -> Void = { _ in }
   ) throws -> (folder: VaultMedia, saved: [SavedImport], failures: Int) {
@@ -1054,7 +1417,7 @@ final class VaultLibrary: @unchecked Sendable {
     defer {
       mutation.unlock()
     }
-    try store.authorize(grant)
+    try validateImportDestination(parentID, using: grant)
     let scoped = source.startAccessingSecurityScopedResource()
     defer {
       if scoped {
@@ -1088,7 +1451,7 @@ final class VaultLibrary: @unchecked Sendable {
         phase: .directory, filename: root.lastPathComponent,
         currentBytes: 0, totalBytes: 0))
     let folder = try autoreleasepool {
-      try saveDirectory(name: root.lastPathComponent, parentID: nil, using: grant)
+      try saveDirectory(name: root.lastPathComponent, parentID: parentID, using: grant)
     }
     var parents: [(level: Int, id: UUID)] = [(0, folder.id)]
     var saved: [SavedImport] = []
@@ -1212,7 +1575,7 @@ final class VaultLibrary: @unchecked Sendable {
     }
     if let parentID {
       let parent = try reader(id: parentID, using: grant).media
-      guard parent.isFolder, !parent.isDocument else {
+      guard parent.isFolder, !parent.isFilePackage else {
         throw VaultError.invalidFolder
       }
     }
@@ -1240,7 +1603,7 @@ final class VaultLibrary: @unchecked Sendable {
     }
     try store.authorize(grant)
     let original = try rawReader(id: id, using: grant).media
-    guard original.isFolder, !original.isDocument else {
+    guard original.isFolder, !original.isFilePackage else {
       throw VaultError.invalidFolder
     }
     guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -1264,7 +1627,8 @@ final class VaultLibrary: @unchecked Sendable {
     let media = VaultMedia(
       id: original.id, originalFilename: name, contentType: original.contentType,
       byteCount: 0, sha256: original.sha256, parentID: original.parentID,
-      folderPassword: original.folderPassword)
+      folderPassword: original.folderPassword, hidden: original.hidden,
+      photoAsset: original.photoAsset)
     return try publishMetadata(
       media, replacing: original, requirements: requirements, using: grant,
       uncertain: .organizationCommitUncertain)
@@ -1283,7 +1647,7 @@ final class VaultLibrary: @unchecked Sendable {
     }
     try store.authorize(grant)
     let original = try rawReader(id: id, using: grant).media
-    guard !original.isFolder || original.isDocument else {
+    guard !original.isFolder || original.isFilePackage else {
       throw VaultError.invalidSelection
     }
     let requirements = try folderRequirements(for: original, includingSelf: true, using: grant)
@@ -1313,7 +1677,8 @@ final class VaultLibrary: @unchecked Sendable {
     let media = VaultMedia(
       id: original.id, originalFilename: name, contentType: original.contentType,
       byteCount: original.byteCount, sha256: original.sha256, parentID: original.parentID,
-      folderPassword: original.folderPassword)
+      folderPassword: original.folderPassword, hidden: original.hidden,
+      photoAsset: original.photoAsset)
     return try publishMetadata(
       media, replacing: original, requirements: requirements, using: grant,
       uncertain: .organizationCommitUncertain)
@@ -1342,7 +1707,7 @@ final class VaultLibrary: @unchecked Sendable {
     var parentID: UUID?
     for name in components {
       let matches = entries.filter {
-        $0.parentID == parentID && $0.isFolder && !$0.isDocument
+        $0.parentID == parentID && $0.isFolder && !$0.isFilePackage
           && $0.originalFilename.localizedCaseInsensitiveCompare(name) == .orderedSame
       }
       guard let folder = matches.first else {
@@ -1351,6 +1716,8 @@ final class VaultLibrary: @unchecked Sendable {
       guard matches.count == 1 else {
         throw VaultError.corrupt
       }
+      _ = try rootRequirement(
+        in: folderChain(for: folder, includingSelf: true, using: grant), using: grant)
       // 在查找下一层名称前先验证当前保护，不能通过路径探测受保护目录的内部结构。
       if let protection = folder.folderPassword {
         do {
@@ -1372,7 +1739,7 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `id`：明确选中的来源文件或未受密码保护的目录树。
   /// - `parentID`：接收目录；为空时移至保险箱根目录。
   /// - `grant`：具有来源及目标目录访问权的当前会话。
-  /// 返回：已认证来源与本次所需目录证明；受保护来源、保护范围逃逸、循环或重名时拒绝。
+  /// 返回：已认证来源与本次所需目录证明；受保护目录树、目录保护范围逃逸、循环或重名时拒绝。
   private func prepareMove(id: UUID, to parentID: UUID?, using grant: VaultGrant) throws
     -> (media: VaultMedia, requirements: [UUID: UUID])
   {
@@ -1396,7 +1763,7 @@ final class VaultLibrary: @unchecked Sendable {
     var destinationProtection: [UUID: UUID] = [:]
     if let parentID {
       let parent = try rawReader(id: parentID, using: grant).media
-      guard parent.isFolder, !parent.isDocument,
+      guard parent.isFolder, !parent.isFilePackage,
         !entries.contains(where: {
           $0.id == parentID
         })
@@ -1405,8 +1772,11 @@ final class VaultLibrary: @unchecked Sendable {
       }
       destinationProtection = try folderRequirements(for: parent, includingSelf: true, using: grant)
     }
-    // 来源仍受祖先保护时，移动不得把内容带到该保护范围之外再导出。
-    guard sourceProtection.isSubset(of: Set(destinationProtection.keys)) else {
+    // 普通目录树仍保留祖先保护范围；单个文件经过本次密码验证后可以移到范围外。
+    guard
+      original.isFilePackage || !original.isFolder
+        || sourceProtection.isSubset(of: Set(destinationProtection.keys))
+    else {
       throw VaultError.protectedFolderMove
     }
     requirements.merge(destinationProtection) { _, destination in
@@ -1427,20 +1797,108 @@ final class VaultLibrary: @unchecked Sendable {
     return (original, requirements)
   }
 
+  /// 业务作用：为一批明确来源建立独立的移动验证，不沿用浏览密码证明。
+  /// 参数说明：
+  /// - `ids`：本次明确选定且不重复的来源身份。
+  /// - `grant`：仍有效的 App 会话。
+  /// 返回：尚无目录权限的单次移动证明；空批次或重复来源时拒绝。
+  func beginMove(ids: [UUID], using grant: VaultGrant) throws -> VaultMoveSession {
+    try store.authorize(grant)
+    guard !ids.isEmpty, Set(ids).count == ids.count else {
+      throw VaultError.invalidMove
+    }
+    return try VaultMoveSession(mediaIDs: ids, owner: self, parent: grant)
+  }
+
+  /// 业务作用：按来源路径查找本次移动尚需重新验证的保护密码。
+  /// 参数说明：
+  /// - `session`：本次明确来源的单次移动证明。
+  /// - `grant`：创建该证明的同一 App 会话。
+  /// 返回：外层优先的下一项密码目录；所有来源均已验证时为空。
+  func nextMoveFolder(_ session: VaultMoveSession, using grant: VaultGrant) throws -> VaultMedia? {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    try store.authorize(grant)
+    let permission = try session.permission(owner: self, parent: grant)
+    for id in session.mediaIDs {
+      if let folder = try nextLockedFolder(id: id, recursive: false, using: permission) {
+        return folder
+      }
+    }
+    return nil
+  }
+
+  /// 业务作用：仅为本次移动验证下一项来源目录密码，不改变普通浏览权限。
+  /// 参数说明：
+  /// - `id`：当前要求验证的目录身份。
+  /// - `password`：本次重新输入的独立目录密码。
+  /// - `session`：本次明确来源的单次移动证明。
+  /// - `grant`：创建该证明的同一 App 会话。
+  /// 返回：正确时增加本次移动证明；错配、错误密码或失权时不开始移动。
+  func authenticateMoveFolder(
+    id: UUID, password: String, session: VaultMoveSession, using grant: VaultGrant
+  ) throws {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    // 来源密码必须逐层验证，不能跳过祖先或用无关目录的密码扩大移动权限。
+    guard try nextMoveFolder(session, using: grant)?.id == id else {
+      throw VaultError.invalidFolder
+    }
+    try authenticateFolder(
+      id: id, password: password,
+      using: session.permission(owner: self, parent: grant))
+  }
+
   /// 业务作用：逐项移动同一目录内的多个条目，先检查整批约束，再以有界缓冲逐文件提交。
   /// 参数说明：
   /// - `ids`：当前批次明确选择且不重复的来源身份。
   /// - `parentID`：统一接收目录；为空时接收至保险箱根目录。
+  /// - `authorization`：受保护文件来源必须提供本次重新验证的单次证明。
   /// - `grant`：已验证来源与目标密码的当前会话。
   /// 返回：新会话、完成数量和中途失败说明；预检失败不移动任何条目，中途失败保留已完成项及其余原件。
-  func move(ids: [UUID], to parentID: UUID?, using grant: VaultGrant) throws -> VaultBatchMoveResult
-  {
+  func move(
+    ids: [UUID], to parentID: UUID?, authorization: VaultMoveSession? = nil,
+    using grant: VaultGrant
+  ) throws -> VaultBatchMoveResult {
     mutation.lock()
     defer {
       mutation.unlock()
     }
     guard !ids.isEmpty, Set(ids).count == ids.count else {
       throw VaultError.invalidMove
+    }
+    defer {
+      authorization?.revoke()
+    }
+    let permission: VaultGrant?
+    if let authorization {
+      guard authorization.mediaIDs == ids, try nextMoveFolder(authorization, using: grant) == nil
+      else {
+        throw VaultError.invalidMove
+      }
+      permission = try authorization.permission(owner: self, parent: grant, consume: true)
+    } else {
+      permission = nil
+    }
+    for id in ids {
+      let source = try rawReader(id: id, using: grant).media
+      let requirements = try folderRequirements(for: source, includingSelf: true, using: grant)
+      if !source.isFolder || source.isFilePackage, let protectedID = requirements.keys.first {
+        // 浏览授权不能替代本次移动验证，文件移出保护范围前必须取得独立来源证明。
+        guard let permission else {
+          throw VaultError.folderPasswordRequired(protectedID)
+        }
+        try permission.access(folders: requirements) { _ in
+          ()
+        }
+        for (folderID, revision) in requirements {
+          try grant.allowFolder(folderID, revision: revision)
+        }
+      }
     }
     let plans = try ids.map {
       try prepareMove(id: $0, to: parentID, using: grant)
@@ -1482,7 +1940,7 @@ final class VaultLibrary: @unchecked Sendable {
             try current.allowFolder(folderID, revision: revision)
           }
         }
-        current = try move(id: id, to: parentID, using: current)
+        current = try moveEntry(id: id, to: parentID, using: current)
         moved += 1
       } catch {
         // 发布结果不明必须保持底层保护态，不能把未知结果计为普通部分完成。
@@ -1516,8 +1974,22 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `id`：明确选中的来源文件或未受密码保护的目录树。
   /// - `parentID`：接收目录；为空时移至保险箱根目录。
   /// - `grant`：具有来源及目标目录访问权的当前会话。
-  /// 返回：移动发布后撤销旧读取并交付新会话；受保护来源、保护范围逃逸、循环或重名时拒绝。
-  func move(id: UUID, to parentID: UUID?, using grant: VaultGrant) throws -> VaultGrant {
+  /// - `authorization`：受保护文件来源必须提供本次重新验证的单次证明。
+  /// 返回：移动发布后撤销旧读取并交付新会话；未验证来源、受保护目录树、循环或重名时拒绝。
+  func move(
+    id: UUID, to parentID: UUID?, authorization: VaultMoveSession? = nil, using grant: VaultGrant
+  ) throws -> VaultGrant {
+    try move(ids: [id], to: parentID, authorization: authorization, using: grant).grant
+  }
+
+  /// 业务作用：整批预检通过后发布单个来源的新层级，逐块重加密并撤销旧读取能力。
+  /// 参数说明：
+  /// - `id`：本批次已完成来源密码验证的条目。
+  /// - `parentID`：本批次明确选择的接收目录。
+  /// - `grant`：持有本批次来源和目标证明的当前会话。
+  /// 返回：完整发布后交付新会话；发布前失败保留原密文，结果不明时锁定保险箱。
+  private func moveEntry(id: UUID, to parentID: UUID?, using grant: VaultGrant) throws -> VaultGrant
+  {
     mutation.lock()
     defer {
       mutation.unlock()
@@ -1529,7 +2001,8 @@ final class VaultLibrary: @unchecked Sendable {
     let media = VaultMedia(
       id: id, originalFilename: original.originalFilename, contentType: original.contentType,
       byteCount: original.byteCount, sha256: original.sha256, parentID: parentID,
-      folderPassword: original.folderPassword)
+      folderPassword: original.folderPassword, hidden: original.hidden,
+      photoAsset: original.photoAsset)
     let identity = MediaIdentity(
       formatVersion: 1, id: id, vaultID: grant.vaultID, byteCount: media.byteCount,
       chunkSize: VaultMediaReader.chunkSize,
@@ -1692,7 +2165,7 @@ final class VaultLibrary: @unchecked Sendable {
   /// 参数说明：
   /// - `id`：待删除的媒体身份。
   /// - `grant`：独立密码授权的当前会话。
-  /// 返回：目标目录树均无密码保护且删除、同步成功后完成；仍受保护时保留全部密文。
+  /// 返回：目标路径及目录树均无密码保护且删除、同步成功后完成；仍受保护时保留全部密文。
   func delete(id: UUID, using grant: VaultGrant) throws {
     let result = try delete(ids: [id], using: grant)
     if let failure = result.failure {
@@ -1746,6 +2219,10 @@ final class VaultLibrary: @unchecked Sendable {
         folders[id] = revision
       }
     }
+    // 祖先保护同样禁止删除单个子文件，访问密码和其它操作证明均不能解除删除保护。
+    guard folders.isEmpty else {
+      throw VaultError.protectedFolderDeletion
+    }
     // 永久删除必须由当前会话明确授权，不能在锁定后由排队任务补执行。
     var deleted = 0
     for group in groups {
@@ -1796,6 +2273,27 @@ final class VaultLibrary: @unchecked Sendable {
       throw VaultError.protectedFolderExport
     }
     return try materialize(id: id, to: directory, using: grant, progress: progress)
+  }
+
+  /// 业务作用：向系统照片交付主图片或主视频，配套资源继续完整保留在保险箱内。
+  /// 参数说明：
+  /// - `id`：明确选择的媒体或完整照片身份。
+  /// - `directory`：本次相册写入独占的私有暂存目录。
+  /// - `grant`：当前会话；原有禁止导出受保护内容的规则继续成立。
+  /// 返回：主媒体文件已经完整复验；受保护路径或完整资源中有保护目录时拒绝。
+  func exportPresentation(id: UUID, to directory: URL, using grant: VaultGrant) throws -> URL {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    let media = try reader(id: id, using: grant).media
+    let ancestors = try folderChain(for: media, includingSelf: true, using: grant)
+    let entries = media.isFolder ? try descendantEntries(of: media, using: grant) : [media]
+    guard !(ancestors + entries).contains(where: { $0.folderPassword != nil }) else {
+      throw VaultError.protectedFolderExport
+    }
+    let primary = try presentationReader(id: id, using: grant).media
+    return try materialize(id: primary.id, to: directory, using: grant, progress: { _ in })
   }
 
   /// 业务作用：为一次明确的系统复制建立独立事务，不沿用普通浏览时已经输入的目录密码。
@@ -1855,10 +2353,12 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `session`：绑定选中条目且尚未消费的单次复制事务。
   /// - `directory`：用户明确选择的系统目标目录。
   /// - `grant`：创建该事务的同一 App 会话。
+  /// - `presentationOnly`：写入系统照片时只交付主媒体，完整资源仍保留在保险箱中。
   /// - `progress`：本次内存中的完成比例，不保存来源或查看历史。
   /// 返回：全部相关目录密码已重新验证且内容完整时发布副本；失败清理暂存，事务不能重放。
   func copyToSystem(
     _ session: VaultCopySession, to directory: URL, using grant: VaultGrant,
+    presentationOnly: Bool = false,
     progress: @Sendable (Double) -> Void = { _ in }
   ) throws -> URL {
     mutation.lock()
@@ -1874,8 +2374,11 @@ final class VaultLibrary: @unchecked Sendable {
     if let missing = try nextLockedFolder(id: session.mediaID, recursive: true, using: permission) {
       throw VaultError.folderPasswordRequired(missing.id)
     }
-    return try materialize(
-      id: session.mediaID, to: directory, using: permission, progress: progress)
+    let id =
+      presentationOnly
+      ? try presentationReader(id: session.mediaID, using: permission).media.id
+      : session.mediaID
+    return try materialize(id: id, to: directory, using: permission, progress: progress)
   }
 
   /// 业务作用：只向保险箱自有随机预览目录交付文档副本，不开放受保护内容的系统导出。
@@ -2056,7 +2559,10 @@ final class VaultLibrary: @unchecked Sendable {
         folders[id] = revision
       }
     }
-    let name = folder.originalFilename
+    let name =
+      folder.photoAsset == nil
+      ? folder.originalFilename
+      : (folder.originalFilename as NSString).deletingPathExtension + "（完整资源）"
     guard name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
       throw VaultError.corrupt
     }
@@ -2082,7 +2588,10 @@ final class VaultLibrary: @unchecked Sendable {
           throw VaultError.corrupt
         }
         if entry.isFolder {
-          let childName = entry.originalFilename
+          let childName =
+            entry.photoAsset == nil
+            ? entry.originalFilename
+            : (entry.originalFilename as NSString).deletingPathExtension + "（完整资源）"
           guard childName != ".", childName != "..", !childName.contains("/"),
             !childName.contains("\0")
           else {
