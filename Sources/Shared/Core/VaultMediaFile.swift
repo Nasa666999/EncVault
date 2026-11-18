@@ -895,9 +895,9 @@ final class VaultLibrary: @unchecked Sendable {
 
   /// 业务作用：将目录密码材料写入新的认证密文，并撤销全部旧读取以防策略变更被绕过。
   /// 参数说明：
-  /// - `id`：需要设置或取消保护的普通目录。
-  /// - `password`：设置时的新密码；取消时为空。
-  /// - `previous`：取消保护必须重新验证的原目录密码。
+  /// - `id`：需要设置、修改或取消保护的普通目录。
+  /// - `password`：设置或修改后的新密码；取消保护时为空。
+  /// - `previous`：修改或取消保护时必须重新验证的原目录密码；首次设置时为空。
   /// - `grant`：当前 App 会话。
   /// 返回：成功后交付清空目录权限的新 App 会话；失败保留原密文或锁定后要求核实。
   func changeFolderPassword(
@@ -918,8 +918,15 @@ final class VaultLibrary: @unchecked Sendable {
     }
     let protection: FolderPassword?
     if let password {
-      guard original.folderPassword == nil else {
-        throw VaultError.folderProtectionExists
+      if original.folderPassword != nil {
+        // 浏览授权与 ROOT 不能代替改密验证；原保护持续生效，只有本次原密码正确才能发布新校验材料。
+        guard let previous else {
+          throw VaultError.folderProtectionExists
+        }
+        try authenticateFolder(id: id, password: previous, using: grant)
+      } else if previous != nil {
+        // 首次设置没有可供验证的原密码，不能让已过期的保护管理请求被当成新设置继续执行。
+        throw VaultError.invalidFolder
       }
       let prepared = try VaultCrypto.folderPassword(password, folderID: id, using: grant)
       // 新保护必须能由本次确认的原始输入立即验证，不能发布尚未证明可用的校验材料。

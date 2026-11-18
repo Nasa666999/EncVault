@@ -1187,6 +1187,14 @@ struct VaultLandingView: View {
               model.setHidden(media, hidden: !media.isHidden)
             }))
       }
+      if media.folderPassword != nil {
+        result.append(
+          VaultMediaMenuItem(
+            title: "修改文件夹访问密码",
+            action: {
+              model.requestFolderPasswordChange(media)
+            }))
+      }
       result.append(
         VaultMediaMenuItem(
           title: media.folderPassword == nil ? "设置文件夹访问密码" : "取消文件夹访问密码",

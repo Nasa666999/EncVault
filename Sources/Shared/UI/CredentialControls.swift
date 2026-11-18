@@ -1080,12 +1080,13 @@ struct FolderPasswordPresentation: View {
   }
 }
 
-/// 目录密码只在当前表单内存中输入，设置、访问和取消保护均不复用 App 密码。
+/// 目录密码只在当前表单内存中输入，设置、修改、访问和取消保护均不复用 App 密码。
 struct FolderPasswordForm: View {
   @ObservedObject var model: VaultModel
   let prompt: VaultModel.FolderPrompt
   @Environment(\.scenePhase) private var scenePhase
   @StateObject private var password = FolderPasswordDraft()
+  @StateObject private var newPassword = FolderPasswordDraft()
   @StateObject private var confirmation = FolderPasswordDraft()
   @State private var localError: String?
 
@@ -1104,11 +1105,20 @@ struct FolderPasswordForm: View {
           .lineLimit(3)
       }
       passwordField(
-        prompt.kind == .setting ? "新文件夹密码" : "文件夹密码", draft: password)
-      if prompt.kind == .setting {
+        prompt.kind == .setting
+          ? "新文件夹密码" : prompt.kind == .changing ? "原文件夹密码" : "文件夹密码",
+        draft: password)
+      if prompt.kind == .changing {
+        passwordField("新文件夹密码", draft: newPassword)
+      }
+      if prompt.kind == .setting || prompt.kind == .changing {
         passwordField("再次确认文件夹密码", draft: confirmation)
         Text("使用 6 至 128 个字符。请妥善保存，App 密码和恢复码不能代替此密码。")
           .font(.caption).foregroundStyle(.secondary)
+        if prompt.kind == .changing {
+          Text("验证原密码后直接更换密码，文件内容和密码保护保持不变。")
+            .font(.caption).foregroundStyle(.secondary)
+        }
       } else if prompt.kind == .removing {
         Text("验证原密码后取消保护，之后只要解锁 App 即可访问此文件夹。")
           .font(.caption).foregroundStyle(.secondary)
@@ -1140,11 +1150,18 @@ struct FolderPasswordForm: View {
         if model.busy {
           ProgressView().controlSize(.small)
         }
-        Button(prompt.kind == .setting ? "设置密码" : prompt.kind == .removing ? "取消密码保护" : "验证并继续") {
+        Button(
+          prompt.kind == .setting
+            ? "设置密码"
+            : prompt.kind == .changing
+              ? "修改密码" : prompt.kind == .removing ? "取消密码保护" : "验证并继续"
+        ) {
           submit()
         }
         .buttonStyle(.borderedProminent)
-        .disabled(model.busy || password.isEmpty)
+        .disabled(
+          model.busy || password.isEmpty
+            || prompt.kind == .changing && (newPassword.isEmpty || confirmation.isEmpty))
       }
     }
     .padding(24)
@@ -1183,6 +1200,8 @@ struct FolderPasswordForm: View {
       return "重命名前验证文件夹密码"
     case .setting:
       return "设置文件夹访问密码"
+    case .changing:
+      return "修改文件夹访问密码"
     case .removing:
       return "取消文件夹访问密码"
     }
@@ -1197,7 +1216,7 @@ struct FolderPasswordForm: View {
     FolderPasswordFieldRow(title: title, draft: draft, enabled: !model.busy)
   }
 
-  /// 业务作用：设置时先检查两次输入一致，再交给受 App 会话保护的派生和验证入口。
+  /// 业务作用：设置或修改时先检查两次新密码一致，再提交本次原密码及新密码快照。
   /// 参数说明：无。
   /// 返回：确认不一致时保留表单；提交后输入原文立即从视图状态移除。
   private func submit() {
@@ -1206,13 +1225,18 @@ struct FolderPasswordForm: View {
     }
     // 在清空控件或更新忙碌状态之前取得原生编辑器快照，后续界面刷新不能改动本次凭据。
     let value = password.take()
+    let changed = newPassword.take()
     let repeated = confirmation.take()
-    if prompt.kind == .setting, !value.utf8.elementsEqual(repeated.utf8) {
+    let candidate = prompt.kind == .changing ? changed : value
+    if prompt.kind == .setting || prompt.kind == .changing,
+      !candidate.utf8.elementsEqual(repeated.utf8)
+    {
       localError = "两次文件夹密码不一致，请重新确认。"
       return
     }
     localError = nil
-    model.submitFolderPassword(value, challengeID: prompt.challengeID)
+    model.submitFolderPassword(
+      value, newPassword: prompt.kind == .changing ? changed : nil, challengeID: prompt.challengeID)
   }
 
   /// 业务作用：结束或切换当前表单时释放密码与确认输入，不建立草稿或日志。
@@ -1220,6 +1244,7 @@ struct FolderPasswordForm: View {
   /// 返回：密码字段与本地提示全部清空。
   private func clearDraft() {
     password.clear()
+    newPassword.clear()
     confirmation.clear()
     localError = nil
   }

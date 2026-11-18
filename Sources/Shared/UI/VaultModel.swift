@@ -60,7 +60,7 @@ final class VaultModel: ObservableObject {
 
   struct FolderPrompt: Identifiable, Sendable {
     enum Kind: Sendable {
-      case access, setting, removing, copy, moveSource, move, rename
+      case access, setting, changing, removing, copy, moveSource, move, rename
     }
     let id: UUID
     let challengeID = UUID()
@@ -1064,24 +1064,49 @@ final class VaultModel: ObservableObject {
   /// - `removing`：是否需要凭原密码取消已有保护。
   /// 返回：只打开当前目录的表单，不立即更改保护状态。
   func requestFolderPassword(_ folder: VaultMedia, removing: Bool) {
+    presentFolderPassword(folder, kind: removing ? .removing : .setting)
+  }
+
+  /// 业务作用：为已有保护的文件夹打开原密码和新密码输入，不先取消原保护。
+  /// 参数说明：
+  /// - `folder`：当前列表中明确选择的受保护普通目录。
+  /// 返回：只创建本次修改表单，尚未验证原密码或改变保护状态。
+  func requestFolderPasswordChange(_ folder: VaultMedia) {
+    presentFolderPassword(folder, kind: .changing)
+  }
+
+  /// 业务作用：将目录保护管理表单绑定到当前可见目录及其已有保护状态。
+  /// 参数说明：
+  /// - `folder`：本次明确选择的普通目录。
+  /// - `kind`：首次设置、修改或取消保护的管理动作。
+  /// 返回：状态匹配时撤销旧操作证明并呈现新表单；忙碌、失权或请求过期时不改变内容。
+  private func presentFolderPassword(_ folder: VaultMedia, kind: FolderPrompt.Kind) {
     guard screen == .library, !busy, folder.isFolder, !folder.isFilePackage,
-      visibleItems.contains(folder)
+      editingText == nil, folderPrompt == nil, visibleItems.contains(folder)
+    else {
+      return
+    }
+    // 表单只管理当前真实保护状态，不能把访问或移动验证误用成取消、改密请求。
+    guard
+      kind == .setting && folder.folderPassword == nil
+        || (kind == .changing || kind == .removing) && folder.folderPassword != nil
     else {
       return
     }
     pendingFolderAction = nil
     cancelSystemCopy()
+    cancelMove()
     message = nil
-    folderPrompt = FolderPrompt(
-      id: UUID(), folder: folder, kind: removing ? .removing : .setting)
+    folderPrompt = FolderPrompt(id: UUID(), folder: folder, kind: kind)
   }
 
   /// 业务作用：只在当前表单与 App 会话仍有效时验证目录密码或提交目录保护变更。
   /// 参数说明：
   /// - `password`：本次输入的独立文本密码，原始值仅供内存派生使用。
+  /// - `newPassword`：修改保护时的新密码；其它动作不使用此值。
   /// - `challengeID`：输入界面持有的本次目录验证身份，不能用于后来出现的表单。
   /// 返回：访问、移动或复制验证成功后继续本次操作；保护变更后撤销旧能力、回到根目录，错误时保留表单。
-  func submitFolderPassword(_ password: String, challengeID: UUID) {
+  func submitFolderPassword(_ password: String, newPassword: String? = nil, challengeID: UUID) {
     guard let prompt = folderPrompt, let library, let grant, let store,
       screen == .library, !busy
     else {
@@ -1090,6 +1115,10 @@ final class VaultModel: ObservableObject {
     // 迟到的界面提交不属于密码校验失败，不能把上一轮错误提示继续当作本轮结果。
     guard prompt.challengeID == challengeID else {
       message = "密码输入页面已更新，本次未验证，请重新输入。"
+      return
+    }
+    if prompt.kind == .changing, newPassword == nil {
+      message = "请输入新文件夹密码。"
       return
     }
     if prompt.kind == .copy {
@@ -1153,8 +1182,11 @@ final class VaultModel: ObservableObject {
     perform(
       {
         let replacement = try library.changeFolderPassword(
-          id: prompt.folder.id, password: prompt.kind == .setting ? password : nil,
-          previous: prompt.kind == .removing ? password : nil, using: grant)
+          id: prompt.folder.id,
+          password: prompt.kind == .setting
+            ? password : prompt.kind == .changing ? newPassword : nil,
+          previous: prompt.kind == .removing || prompt.kind == .changing ? password : nil,
+          using: grant)
         do {
           return (replacement, try library.list(using: replacement))
         } catch {
@@ -1175,7 +1207,10 @@ final class VaultModel: ObservableObject {
         self.currentFolderID = nil
         self.pendingFolderAction = nil
         self.folderPrompt = nil
-        self.message = prompt.kind == .setting ? "已设置文件夹独立访问密码。" : "已取消文件夹访问密码。"
+        self.message =
+          prompt.kind == .setting
+          ? "已设置文件夹独立访问密码。"
+          : prompt.kind == .changing ? "已修改文件夹访问密码，请使用新密码访问。" : "已取消文件夹访问密码。"
       })
   }
 
