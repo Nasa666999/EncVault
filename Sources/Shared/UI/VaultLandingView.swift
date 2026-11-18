@@ -25,7 +25,7 @@ struct VaultLandingView: View {
   @State private var renamingItem: VaultMedia?
   @State private var renamedItemName = ""
   @State private var inspecting: VaultMedia?
-  @State private var systemSaveMedia: VaultMedia?
+  @State private var systemSaveMedia: [VaultMedia] = []
   @State private var systemSaveAction = SystemSaveAction.export
   @State private var systemSaveWarning = false
   @State private var choosingPhotos = false
@@ -79,7 +79,7 @@ struct VaultLandingView: View {
           inspecting = nil
           renamedItemName = ""
           systemSaveWarning = false
-          systemSaveMedia = nil
+          systemSaveMedia = []
           systemSaveAction = .export
           leaveFullScreen()
         }
@@ -518,44 +518,60 @@ struct VaultLandingView: View {
             ? "此操作不能撤销，将永久删除文件夹及其中全部加密子项。目录树中仍有密码保护时不能删除，请先取消相关文件夹密码。来源原件和此前导出的副本不受影响。"
             : "此操作不能撤销。来源原件和此前导出的副本不受影响。")
       }
-      .confirmationDialog(systemSaveAction.title, isPresented: $systemSaveWarning) {
+      .confirmationDialog(
+        systemSaveMedia.count > 1
+          ? "\(systemSaveAction.title)（\(systemSaveMedia.count) 项）" : systemSaveAction.title,
+        isPresented: $systemSaveWarning
+      ) {
         Button(
-          systemSaveMedia?.photoAsset == nil
+          !systemSaveMedia.contains(where: {
+            $0.photoAsset != nil
+          })
             ? "选择本地目录并\(systemSaveAction.rawValue)" : "选择本地目录保存全部照片资源"
         ) {
           chooseFiles(for: .systemDirectory)
         }
-        if let media = systemSaveMedia, media.isImage || media.isVideo,
-          systemSaveAction == .copy || media.photoAsset == nil
+        if !systemSaveMedia.isEmpty,
+          systemSaveMedia.allSatisfy({
+            $0.isImage || $0.isVideo
+          }),
+          systemSaveAction == .copy
+            || systemSaveMedia.allSatisfy({
+              $0.photoAsset == nil
+            })
         {
           Button(systemSaveAction == .copy ? "复制到系统照片" : "导出到系统照片并移除原件") {
             switch systemSaveAction {
             case .copy:
-              model.copyToPhotos(media)
+              model.copyToPhotos(systemSaveMedia)
             case .export:
-              model.exportToPhotos(media)
+              model.exportToPhotos(systemSaveMedia)
             }
-            systemSaveMedia = nil
+            systemSaveMedia = []
           }
         }
         #if os(macOS)
           // Mac 识别取消角色后不会再自动补出第二个取消按钮。
           Button("取消", role: .cancel) {
-            systemSaveMedia = nil
+            systemSaveMedia = []
           }
         #else
           // iPhone 弹出菜单会隐藏系统取消动作，保留一个可见的返回入口。
           Button("取消") {
-            systemSaveMedia = nil
+            systemSaveMedia = []
           }
         #endif
       } message: {
         Text(
           systemSaveAction == .copy
-            ? systemSaveMedia?.photoAsset != nil
+            ? systemSaveMedia.contains(where: {
+              $0.photoAsset != nil
+            })
               ? "复制到系统照片只保存主图片或主视频；复制到本地目录会保存全部配套资源。保险箱内原件继续保留，保护规则保持不变。系统副本未加密，可能按系统设置同步或备份。"
               : "按原名生成未加密副本，保险箱内原件继续保留，密码保护不变。受保护目录每次复制需重新验证，文件夹包含全部内容。系统副本可能按系统设置同步或备份。"
-            : systemSaveMedia?.photoAsset != nil
+            : systemSaveMedia.contains(where: {
+              $0.photoAsset != nil
+            })
               ? "导出到本地目录会完整保存全部照片资源，完整校验成功后删除保险箱内原件。系统相册单资源入口不用于此类导出。受保护内容需先取消目录密码。系统文件未加密，可能按系统设置同步或备份。"
               : "按原名保存到系统，完整校验成功后删除保险箱内原件。受保护内容需先取消目录密码。系统文件未加密，可能按系统设置同步或备份。"
         )
@@ -928,57 +944,110 @@ struct VaultLandingView: View {
     .layoutPriority(1)
   }
 
-  /// 业务作用：在选择模式集中呈现数量、批量目标与来源保护限制。
+  /// 业务作用：在选择模式集中呈现数量和批量动作，小屏幕自动换行保持入口可见。
   /// 参数说明：无。
-  /// 返回：可对整批选择移动或二次确认删除，不能静默跳过受保护来源。
+  /// 返回：全部动作针对明确选择，复制和导出保持与单项相同的保护限制。
   private var selectionControls: some View {
     VStack(alignment: .leading, spacing: 6) {
-      HStack {
-        Text("已选 \(model.selectedItems.count) 项").font(.headline)
-          .accessibilityIdentifier("多选数量")
-        Spacer()
-        Button {
-          model.beginMigration(.send, media: model.selectedItems)
-        } label: {
-          Label("发送", systemImage: "paperplane")
+      ViewThatFits(in: .horizontal) {
+        HStack {
+          selectionCount
+          Spacer()
+          selectionActions
         }
-        .disabled(model.busy || model.selectedItems.isEmpty)
-        Menu {
-          Button("移动到文件夹") {
-            presentMove(model.selectedItems, byPath: false)
+        VStack(alignment: .leading, spacing: 8) {
+          selectionCount
+          LazyVGrid(columns: [GridItem(.adaptive(minimum: 170))], spacing: 8) {
+            selectionActions
           }
-          Button("移动到指定目录") {
-            presentMove(model.selectedItems, byPath: true)
-          }
-          if model.currentFolderID != nil {
-            Button("移动到上级") {
-              model.moveToParent(model.selectedItems)
-            }
-            .disabled(!model.selectedItems.allSatisfy(model.canMoveToParent))
-          }
-        } label: {
-          Label("移动", systemImage: "folder")
         }
-        .buttonStyle(.borderedProminent)
-        .accessibilityLabel("移动所选项目")
-        .disabled(model.busy || !model.canMoveSelection)
-        Button(role: .destructive) {
-          deletingSelection = model.selectedItems
-        } label: {
-          Label("删除", systemImage: "trash")
-        }
-        .accessibilityLabel("删除所选项目")
-        .disabled(model.busy || !model.canDeleteSelection)
       }
       if !model.selectedItems.isEmpty && !model.canMoveSelection {
-        Text("所选项目含密码保护文件夹，请先取消保护后再移动或删除。")
+        Text("所选项目含密码保护文件夹，请先取消保护后再移动、导出或删除。")
           .font(.caption).foregroundStyle(.secondary)
       } else if !model.selectedItems.isEmpty && !model.canDeleteSelection {
-        Text("所选项目受文件夹密码保护，不能删除；移出保护范围需验证来源文件夹密码。")
+        Text("所选项目受文件夹密码保护，不能导出或删除；复制和移出保护范围需验证来源文件夹密码。")
           .font(.caption).foregroundStyle(.secondary)
       }
     }
     .padding(12)
+  }
+
+  /// 业务作用：在宽屏与窄屏操作栏中保持相同的已选数量标识。
+  /// 参数说明：无。
+  /// 返回：当前可见且仍存在的选择数量。
+  private var selectionCount: some View {
+    Text("已选 \(model.selectedItems.count) 项").font(.headline)
+      .accessibilityIdentifier("多选数量")
+  }
+
+  /// 业务作用：向整批选择提供系统复制、删源导出、迁移、移动和删除入口。
+  /// 参数说明：无。
+  /// 返回：导出与删除使用整批保护门禁，空选择及后台工作期间不可执行。
+  @ViewBuilder
+  private var selectionActions: some View {
+    Button {
+      presentSystemSave(model.selectedItems, action: .copy)
+    } label: {
+      Label("解密复制到系统", systemImage: "doc.on.doc")
+    }
+    .accessibilityLabel("解密复制所选项目到系统")
+    .disabled(model.busy || model.selectedItems.isEmpty)
+    Button {
+      presentSystemSave(model.selectedItems, action: .export)
+    } label: {
+      Label("解密导出到系统", systemImage: "square.and.arrow.up")
+    }
+    .accessibilityLabel("解密导出所选项目到系统")
+    .disabled(model.busy || !model.canDeleteSelection)
+    Button {
+      model.beginMigration(.send, media: model.selectedItems)
+    } label: {
+      Label("发送", systemImage: "paperplane")
+    }
+    .disabled(model.busy || model.selectedItems.isEmpty)
+    Menu {
+      Button("移动到文件夹") {
+        presentMove(model.selectedItems, byPath: false)
+      }
+      Button("移动到指定目录") {
+        presentMove(model.selectedItems, byPath: true)
+      }
+      if model.currentFolderID != nil {
+        Button("移动到上级") {
+          model.moveToParent(model.selectedItems)
+        }
+        .disabled(!model.selectedItems.allSatisfy(model.canMoveToParent))
+      }
+    } label: {
+      Label("移动", systemImage: "folder")
+    }
+    .buttonStyle(.borderedProminent)
+    .accessibilityLabel("移动所选项目")
+    .disabled(model.busy || !model.canMoveSelection)
+    Button(role: .destructive) {
+      deletingSelection = model.selectedItems
+    } label: {
+      Label("删除", systemImage: "trash")
+    }
+    .accessibilityLabel("删除所选项目")
+    .disabled(model.busy || !model.canDeleteSelection)
+  }
+
+  /// 业务作用：固定本次单项或批量系统保存快照，确认期间不随勾选变化而改变对象。
+  /// 参数说明：
+  /// - `media`：本次明确选择的全部文件或目录。
+  /// - `action`：保留原件的复制或完整保存后删源的导出。
+  /// 返回：非空且保护允许时呈现系统目标确认，否则不进入选择器。
+  private func presentSystemSave(_ media: [VaultMedia], action: SystemSaveAction) {
+    guard model.screen == .library, !model.busy, !media.isEmpty,
+      action == .copy || !media.contains(where: model.exportRestricted)
+    else {
+      return
+    }
+    systemSaveAction = action
+    systemSaveMedia = media
+    systemSaveWarning = true
   }
 
   /// 业务作用：以本次来源快照打开统一目标选择，避免弹窗期间的选择变化改换操作对象。
@@ -1142,15 +1211,15 @@ struct VaultLandingView: View {
       case .media, .importDirectory:
         model.importFiles(urls)
       case .systemDirectory:
-        if let directory = urls.first, let media = systemSaveMedia {
+        if let directory = urls.first, !systemSaveMedia.isEmpty {
           switch systemSaveAction {
           case .copy:
-            model.copyToSystem(media, to: directory)
+            model.copyToSystem(systemSaveMedia, to: directory)
           case .export:
-            model.export(media, to: directory)
+            model.export(systemSaveMedia, to: directory)
           }
         }
-        systemSaveMedia = nil
+        systemSaveMedia = []
       }
     case .failure(let error):
       let failure = error as NSError
@@ -1158,7 +1227,7 @@ struct VaultLandingView: View {
         model.message = "系统文件选择器未能完成操作，请重试。"
       }
       if fileSelection == .systemDirectory {
-        systemSaveMedia = nil
+        systemSaveMedia = []
       }
     }
   }
@@ -1283,9 +1352,7 @@ struct VaultLandingView: View {
           else {
             return
           }
-          systemSaveAction = action
-          systemSaveMedia = media
-          systemSaveWarning = true
+          presentSystemSave([media], action: action)
         })
     }
   }
@@ -1305,7 +1372,7 @@ struct VaultLandingView: View {
     sourceConfirmation = false
     deleting = nil
     inspecting = nil
-    systemSaveMedia = nil
+    systemSaveMedia = []
     systemSaveWarning = false
     systemSaveAction = .export
     choosingPhotos = false

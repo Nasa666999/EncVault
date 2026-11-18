@@ -480,6 +480,13 @@ struct VaultBatchMoveResult: Sendable {
   let failure: VaultError?
 }
 
+/// 系统批量保存只记录已经完整完成的条目，失败项目不能计入成功数量。
+struct VaultSystemSaveResult: Sendable {
+  let completedIDs: [UUID]
+  let totalCount: Int
+  let failure: VaultError?
+}
+
 /// 加密媒体目录，不创建播放历史、明文索引或明文缩略图。
 final class VaultLibrary: @unchecked Sendable {
   let store: VaultStore
@@ -2378,6 +2385,120 @@ final class VaultLibrary: @unchecked Sendable {
     return destination
   }
 
+  /// 业务作用：整批检查保护与目标冲突后逐项导出，只有当前项目完整保存后才删除其原件。
+  /// 参数说明：
+  /// - `ids`：当前同层明确选择且不重复的条目身份。
+  /// - `directory`：本批次统一的系统目标目录。
+  /// - `grant`：当前有效的独立密码会话。
+  /// 返回：整批预检拒绝时没有输出；处理中失败则报告已完成身份并停止，其余项目不继续执行。
+  func export(ids: [UUID], to directory: URL, using grant: VaultGrant) throws
+    -> VaultSystemSaveResult
+  {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    let media = try systemSaveEntries(ids: ids, using: grant)
+    // 任一来源仍受保护时整批拒绝，不能先导出普通项目再跳过保护项目。
+    for item in media {
+      let path = try folderChain(for: item, includingSelf: true, using: grant)
+      let contents = item.isFolder ? try descendantEntries(of: item, using: grant) : [item]
+      guard
+        !(path + contents).contains(where: {
+          $0.folderPassword != nil
+        })
+      else {
+        throw VaultError.protectedFolderExport
+      }
+      // 隐藏子目录也必须在批次输出前核对 ROOT，不能在前项删源后才发现后项无权访问。
+      _ = try rootRequirement(in: path + contents, using: grant)
+    }
+    try preflightSystemDestination(media, to: directory)
+    var completed: [UUID] = []
+    for id in ids {
+      do {
+        try Task.checkCancellation()
+        _ = try export(id: id, to: directory, using: grant)
+        completed.append(id)
+      } catch {
+        // 已完整导出的项目不能回滚；当前删源不明时也不声称所有未计数项目仍完整留在原处。
+        return VaultSystemSaveResult(
+          completedIDs: completed, totalCount: ids.count,
+          failure: error as? VaultError ?? .storage)
+      }
+    }
+    return VaultSystemSaveResult(completedIDs: completed, totalCount: ids.count, failure: nil)
+  }
+
+  /// 业务作用：限定批量系统保存为同层唯一条目，避免重复输出或祖先与子项被同时处理。
+  /// 参数说明：
+  /// - `ids`：本次明确选择的条目身份。
+  /// - `grant`：当前有效的 App 会话。
+  /// 返回：认证元数据快照；重复、跨层、失权或隐藏路径不可访问时拒绝。
+  private func systemSaveEntries(ids: [UUID], using grant: VaultGrant) throws -> [VaultMedia] {
+    try store.authorize(grant)
+    guard !ids.isEmpty, Set(ids).count == ids.count else {
+      throw VaultError.invalidSelection
+    }
+    let media = try ids.map {
+      try rawReader(id: $0, using: grant).media
+    }
+    // 同层选择不能包含自身祖先，保护检查和输出清单始终针对这一份明确选择。
+    guard
+      media.allSatisfy({
+        $0.parentID == media[0].parentID
+      })
+    else {
+      throw VaultError.invalidSelection
+    }
+    for item in media {
+      _ = try folderRequirements(for: item, includingSelf: true, using: grant)
+    }
+    return media
+  }
+
+  /// 业务作用：在任何批量明文输出前检查目标目录和整批最终名称，拒绝覆盖或自动改名。
+  /// 参数说明：
+  /// - `media`：本批次已经认证的同层条目。
+  /// - `directory`：用户明确选择的系统目标目录。
+  /// 返回：本地普通目录且所有名称均可用时成功；冲突或无效位置时不生成文件。
+  private func preflightSystemDestination(_ media: [VaultMedia], to directory: URL) throws {
+    let scoped = directory.startAccessingSecurityScopedResource()
+    defer {
+      if scoped {
+        directory.stopAccessingSecurityScopedResource()
+      }
+    }
+    let properties = try directory.resourceValues(forKeys: [
+      .isDirectoryKey, .isSymbolicLinkKey, .isUbiquitousItemKey, .volumeIsLocalKey,
+    ])
+    guard properties.isDirectory == true, properties.isSymbolicLink != true,
+      properties.isUbiquitousItem != true, properties.volumeIsLocal != false
+    else {
+      throw VaultError.storage
+    }
+    var names: [String] = []
+    for item in media {
+      let name =
+        item.photoAsset == nil
+        ? item.originalFilename
+        : (item.originalFilename as NSString).deletingPathExtension + "（完整资源）"
+      guard name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
+        throw VaultError.corrupt
+      }
+      // 名称同时对整批及现有目录检查，防止前几个项目完成后才发现可预知的后续冲突。
+      guard
+        !names.contains(where: {
+          $0.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }),
+        !FileManager.default.fileExists(atPath: directory.appendingPathComponent(name).path)
+      else {
+        throw VaultError.destinationExists
+      }
+      names.append(name)
+    }
+  }
+
   /// 业务作用：为系统相册导出准备经过校验的单一媒体暂存，系统提交前不删除保险箱原件。
   /// 参数说明：
   /// - `id`：明确选择的媒体或完整照片身份。
@@ -2438,6 +2559,98 @@ final class VaultLibrary: @unchecked Sendable {
     try store.authorize(grant)
     _ = try rawReader(id: id, using: grant).media
     return try VaultCopySession(mediaID: id, owner: self, parent: grant)
+  }
+
+  /// 业务作用：为同层选择建立彼此独立、同属本次批量操作的复制能力。
+  /// 参数说明：
+  /// - `ids`：当前明确选择且不重复的来源身份。
+  /// - `grant`：当前有效的 App 会话。
+  /// 返回：每项尚未消费的复制事务；没有输出或继承浏览密码证明。
+  func beginCopies(ids: [UUID], using grant: VaultGrant) throws -> [VaultCopySession] {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    _ = try systemSaveEntries(ids: ids, using: grant)
+    return try ids.map {
+      try beginCopy(id: $0, using: grant)
+    }
+  }
+
+  /// 业务作用：按批次顺序查找尚缺的目录证明，共同目录已经验证后不重复提示。
+  /// 参数说明：
+  /// - `sessions`：本批次每个来源独占的复制事务。
+  /// - `grant`：创建全部事务的同一 App 会话。
+  /// 返回：下一项待验证目录；全部完成时为空，失效事务立即拒绝。
+  func nextCopyFolder(_ sessions: [VaultCopySession], using grant: VaultGrant) throws -> VaultMedia?
+  {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    _ = try systemSaveEntries(ids: sessions.map(\.mediaID), using: grant)
+    for session in sessions {
+      if let folder = try nextCopyFolder(session, using: grant) {
+        return folder
+      }
+    }
+    return nil
+  }
+
+  /// 业务作用：为本批次验证一次共同目录密码，只向确实需要此目录的复制事务转交证明。
+  /// 参数说明：
+  /// - `id`：批次当前要求验证的保护目录。
+  /// - `password`：本次原始目录密码，仅在调用期间使用。
+  /// - `sessions`：同一批次来源的复制事务。
+  /// - `grant`：创建事务的同一有效 App 会话。
+  /// 返回：正确时授权当前共同保护层；错误、跳层、错配或取消时不输出明文。
+  func authenticateCopyFolder(
+    id: UUID, password: String, sessions: [VaultCopySession], using grant: VaultGrant
+  ) throws {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    guard try nextCopyFolder(sessions, using: grant)?.id == id,
+      let first = try sessions.first(where: {
+        try nextCopyFolder($0, using: grant)?.id == id
+      })
+    else {
+      throw VaultError.invalidFolder
+    }
+    try authenticateCopyFolder(id: id, password: password, session: first, using: grant)
+    let folder = try rawReader(id: id, using: grant).media
+    guard let protection = folder.folderPassword else {
+      throw VaultError.invalidFolder
+    }
+    for session in sessions where session !== first {
+      if try nextCopyFolder(session, using: grant)?.id == id {
+        let permission = try session.permission(owner: self, parent: grant)
+        let parents = try folderRequirements(for: folder, includingSelf: false, using: permission)
+        // 仅向本批次当前确实缺少该层、且祖先已验证的临时能力转交证明，不授予浏览或导出权限。
+        try permission.allowFolder(id, revision: protection.revision, requiring: parents)
+      }
+    }
+  }
+
+  /// 业务作用：所有复制证明齐备后，整批检查本地输出名称，之后各项仍须独立消费自己的能力。
+  /// 参数说明：
+  /// - `sessions`：当前批次尚未消费的复制事务。
+  /// - `directory`：统一系统目标目录。
+  /// - `grant`：创建事务的当前会话。
+  /// 返回：授权和目标均完整时成功；任一缺失或冲突时没有明文输出。
+  func preflightCopies(_ sessions: [VaultCopySession], to directory: URL, using grant: VaultGrant)
+    throws
+  {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    if let folder = try nextCopyFolder(sessions, using: grant) {
+      throw VaultError.folderPasswordRequired(folder.id)
+    }
+    try preflightSystemDestination(
+      systemSaveEntries(ids: sessions.map(\.mediaID), using: grant), to: directory)
   }
 
   /// 业务作用：在本次复制中按外层优先找出需要重新验证的目录，包含所有受保护子目录。

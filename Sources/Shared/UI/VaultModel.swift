@@ -89,9 +89,19 @@ final class VaultModel: ObservableObject {
   }
 
   private struct PendingCopy: Sendable {
-    let media: VaultMedia
+    let id = UUID()
+    let media: [VaultMedia]
     let destination: CopyDestination
-    let session: VaultCopySession
+    let sessions: [VaultCopySession]
+
+    /// 业务作用：结束批次时撤销每个来源的独立复制证明。
+    /// 参数说明：无。
+    /// 返回：没有临时密码权限留给后续复制或浏览。
+    func revoke() {
+      for session in sessions {
+        session.revoke()
+      }
+    }
   }
 
   private struct InternalDrag {
@@ -1128,13 +1138,13 @@ final class VaultModel: ObservableObject {
       perform(
         {
           try library.authenticateCopyFolder(
-            id: prompt.folder.id, password: password, session: request.session, using: grant)
+            id: prompt.folder.id, password: password, sessions: request.sessions, using: grant)
         },
         success: { [weak self] in
           guard let self, self.folderPrompt?.challengeID == prompt.challengeID,
-            self.pendingCopy?.session === request.session
+            self.pendingCopy?.id == request.id
           else {
-            request.session.revoke()
+            request.revoke()
             return
           }
           self.continueSystemCopy(request)
@@ -1993,7 +2003,25 @@ final class VaultModel: ObservableObject {
   /// - `directory`：系统选择器授权的目标目录。
   /// 返回：涉及保护时要求本次重新验证，全部通过且内容完整后发布；失权或重名时拒绝，不删除密文。
   func copyToSystem(_ media: VaultMedia, to directory: URL) {
+    beginSystemCopy([media], destination: .directory(directory))
+  }
+
+  /// 业务作用：为同层所选文件或目录启动一次统一目标复制，原件始终保留。
+  /// 参数说明：
+  /// - `media`：本次明确选择的全部条目快照。
+  /// - `directory`：用户选择的统一系统目标目录。
+  /// 返回：全部保护密码验证后逐项复制，显示完成数量与失败原因。
+  func copyToSystem(_ media: [VaultMedia], to directory: URL) {
     beginSystemCopy(media, destination: .directory(directory))
+  }
+
+  /// 业务作用：把同层选择完整导出到同一系统目录，每项校验成功后才删源。
+  /// 参数说明：
+  /// - `media`：本次明确选定的文件与目录。
+  /// - `directory`：本次统一的系统目标目录。
+  /// 返回：整批预检通过后逐项提交，并刷新实际剩余条目。
+  func export(_ media: [VaultMedia], to directory: URL) {
+    beginSystemExport(media, destination: .directory(directory))
   }
 
   /// 业务作用：用户确认后将单一媒体完整保存到系统照片，复验成功后删除保险箱原件。
@@ -2012,115 +2040,255 @@ final class VaultModel: ObservableObject {
     guard media.isImage || media.isVideo else {
       return
     }
+    beginSystemCopy([media], destination: .photos)
+  }
+
+  /// 业务作用：将明确选择的全部图片视频复制到系统照片，复合照片交付主媒体且保留原件。
+  /// 参数说明：
+  /// - `media`：全部为图片或视频的同层选择。
+  /// 返回：全部目录密码验证后逐项复制，不静默跳过非媒体项目。
+  func copyToPhotos(_ media: [VaultMedia]) {
+    guard !media.isEmpty,
+      media.allSatisfy({
+        $0.isImage || $0.isVideo
+      })
+    else {
+      return
+    }
     beginSystemCopy(media, destination: .photos)
   }
 
-  /// 业务作用：每次复制都建立新的目录验证事务，不能沿用浏览时取得的密码证明。
+  /// 业务作用：将全部选中单一媒体导出到相册，逐项完整复验后删除各自原件。
   /// 参数说明：
-  /// - `media`：用户明确选择的文件或完整目录。
-  /// - `destination`：本次确认的系统目录或系统照片。
-  /// 返回：准备只属于本次复制的临时能力；未通过目录密码前不生成明文。
-  private func beginSystemCopy(_ media: VaultMedia, destination: CopyDestination) {
-    guard let library, let grant, screen == .library, !busy, closeViewer() else {
+  /// - `media`：全部为无配套资源的图片或视频选择。
+  /// 返回：含文档、目录或复合照片时整批拒绝，不生成不完整的删源导出。
+  func exportToPhotos(_ media: [VaultMedia]) {
+    beginSystemExport(media, destination: .photos)
+  }
+
+  /// 业务作用：为明确选择建立独立复制批次，共同保护密码只在本次批次验证一次。
+  /// 参数说明：
+  /// - `media`：本次明确选择的全部同层条目。
+  /// - `destination`：统一系统目录或系统照片。
+  /// 返回：创建空的临时证明；失权或选择过期时不生成明文。
+  private func beginSystemCopy(_ media: [VaultMedia], destination: CopyDestination) {
+    guard let library, let grant, screen == .library, !busy, !media.isEmpty,
+      editingText == nil, media.allSatisfy(visibleItems.contains), closeViewer()
+    else {
       return
     }
-    // 每次用户选择都从新的复制事务开始，不能复用上一次取消或已完成的目录验证。
     cancelSystemCopy()
     folderPrompt = nil
     pendingFolderAction = nil
     perform(
       {
-        try library.beginCopy(id: media.id, using: grant)
+        try library.beginCopies(ids: media.map(\.id), using: grant)
       },
-      discard: { session in
-        session.revoke()
-      },
-      success: { [weak self] session in
-        guard let self else {
+      discard: { sessions in
+        for session in sessions {
           session.revoke()
+        }
+      },
+      success: { [weak self] sessions in
+        guard let self else {
+          for session in sessions {
+            session.revoke()
+          }
           return
         }
-        let request = PendingCopy(media: media, destination: destination, session: session)
+        let request = PendingCopy(media: media, destination: destination, sessions: sessions)
         self.pendingCopy = request
         self.continueSystemCopy(request)
       })
   }
 
-  /// 业务作用：按顺序要求本次复制涉及的所有目录密码，全部通过后才开放系统输出。
+  /// 业务作用：按顺序完成批次的全部目录验证，共同祖先不重复提示。
   /// 参数说明：
-  /// - `request`：绑定当前选中条目和目的地的复制请求。
-  /// 返回：缺少证明时显示独立目录输入；全部满足后关闭输入并开始复制。
+  /// - `request`：仍属于当前界面的复制批次。
+  /// 返回：缺少证明时等待输入，全部齐备后才开放系统输出。
   private func continueSystemCopy(_ request: PendingCopy) {
-    guard let library, let grant, pendingCopy?.session === request.session,
+    guard let library, let grant, pendingCopy?.id == request.id,
       screen == .library, !busy
     else {
-      request.session.revoke()
+      request.revoke()
       return
     }
     perform(
       {
-        try library.nextCopyFolder(request.session, using: grant)
+        try library.nextCopyFolder(request.sessions, using: grant)
       },
       discard: { _ in
-        request.session.revoke()
+        request.revoke()
       },
       success: { [weak self] folder in
-        guard let self, self.pendingCopy?.session === request.session else {
-          request.session.revoke()
+        guard let self, self.pendingCopy?.id == request.id else {
+          request.revoke()
           return
         }
         if let folder {
           self.folderPrompt = FolderPrompt(
             id: self.folderPrompt?.id ?? UUID(), folder: folder, kind: .copy)
         } else {
-          // 全部目录证明齐备后才关闭密码输入并开始输出，底层仍会在消费时再次核对。
+          // 整批证明完整后才输出，后续每项还要消费其独占能力，不能借批次权限重复复制。
           self.folderPrompt = nil
           self.finishSystemCopy(request)
         }
       })
   }
 
-  /// 业务作用：消费已重新验证的单次复制权限，保存系统副本但不更改保险箱原件与保护状态。
+  /// 业务作用：消费批次独立证明并逐项复制，停止于首个失败且保留全部保险箱原件。
   /// 参数说明：
-  /// - `request`：目录验证完整且仍属于当前界面的复制请求。
-  /// 返回：成功后撤销临时能力并提示；失败保留原件，不把权限留给下一次复制。
+  /// - `request`：所有目录证明齐备的当前复制批次。
+  /// 返回：报告完成数量并撤销全部证明，未完成项继续保留选择以便重新操作。
   private func finishSystemCopy(_ request: PendingCopy) {
-    guard let library, let grant, pendingCopy?.session === request.session,
-      screen == .library, !busy
-    else {
-      request.session.revoke()
+    guard let library, let grant, pendingCopy?.id == request.id, screen == .library, !busy else {
+      request.revoke()
       return
     }
     let photos = photos
     perform(
       {
         defer {
-          request.session.revoke()
+          request.revoke()
         }
-        switch request.destination {
+        var completed: [UUID] = []
+        do {
+          if case .directory(let directory) = request.destination {
+            try library.preflightCopies(request.sessions, to: directory, using: grant)
+          }
+          for (media, session) in zip(request.media, request.sessions) {
+            try Task.checkCancellation()
+            switch request.destination {
+            case .directory(let directory):
+              _ = try library.copyToSystem(session, to: directory, using: grant)
+            case .photos:
+              guard let photos else {
+                throw VaultError.storage
+              }
+              try await photos.copy(media, session: session, using: grant)
+            }
+            completed.append(media.id)
+          }
+          return VaultSystemSaveResult(
+            completedIDs: completed, totalCount: request.media.count, failure: nil)
+        } catch {
+          return VaultSystemSaveResult(
+            completedIDs: completed, totalCount: request.media.count,
+            failure: error as? VaultError ?? .storage)
+        }
+      },
+      success: { [weak self] result in
+        guard let self, self.pendingCopy?.id == request.id else {
+          return
+        }
+        self.cancelSystemCopy()
+        self.finishSystemSelection(result)
+        self.message = self.systemSaveNotice(.copy, result: result)
+      })
+  }
+
+  /// 业务作用：整批保护与目标检查通过后逐项导出，完整提交的项目才移除保险箱原件。
+  /// 参数说明：
+  /// - `media`：本次明确选择的同层快照。
+  /// - `destination`：统一系统目录或系统相册。
+  /// 返回：刷新实际剩余内容并报告完成数量，受保护或不兼容的选择在输出前整批拒绝。
+  private func beginSystemExport(_ media: [VaultMedia], destination: CopyDestination) {
+    guard let library, let grant, screen == .library, !busy, !media.isEmpty,
+      editingText == nil, media.allSatisfy(visibleItems.contains)
+    else {
+      return
+    }
+    // 不允许通过批次跳过受保护项目，也不允许把复合照片作为单一相册资源删源导出。
+    guard !media.contains(where: exportRestricted) else {
+      message = VaultError.protectedFolderExport.localizedDescription
+      return
+    }
+    if case .photos = destination,
+      !media.allSatisfy({
+        ($0.isImage || $0.isVideo) && $0.photoAsset == nil
+      })
+    {
+      message = "所选项目不能全部导出到系统照片，请选择本地目录完整导出。"
+      return
+    }
+    guard closeViewer() else {
+      return
+    }
+    clearThumbnails()
+    let photos = photos
+    perform(
+      {
+        let result: VaultSystemSaveResult
+        switch destination {
         case .directory(let directory):
-          _ = try library.copyToSystem(request.session, to: directory, using: grant)
+          result = try library.export(ids: media.map(\.id), to: directory, using: grant)
         case .photos:
           guard let photos else {
             throw VaultError.storage
           }
-          try await photos.copy(request.media, session: request.session, using: grant)
+          var completed: [UUID] = []
+          var failure: VaultError?
+          for item in media {
+            do {
+              try Task.checkCancellation()
+              try await photos.export(item, using: grant)
+              completed.append(item.id)
+            } catch {
+              failure = error as? VaultError ?? .storage
+              break
+            }
+          }
+          result = VaultSystemSaveResult(
+            completedIDs: completed, totalCount: media.count, failure: failure)
         }
+        return (result, try library.list(using: grant))
       },
-      success: { [weak self] in
-        guard let self, self.pendingCopy?.session === request.session else {
+      success: { [weak self] result, items in
+        guard let self else {
           return
         }
-        self.cancelSystemCopy()
-        self.message = "已按原名复制到系统，保险箱内原件及文件夹密码保护继续保留。系统中的副本未加密。"
+        self.items = items
+        self.clearThumbnails()
+        self.finishSystemSelection(result)
+        self.message = self.systemSaveNotice(.export, result: result)
       })
+  }
+
+  /// 业务作用：完成的项目退出勾选，未完成项目保留，避免重试时再次输出已完成项目。
+  /// 参数说明：
+  /// - `result`：批次的实际完成身份与总量。
+  /// 返回：全部完成时结束选择模式；部分完成时仅保留仍存在的未完成选择。
+  private func finishSystemSelection(_ result: VaultSystemSaveResult) {
+    if result.failure == nil {
+      endSelection()
+    } else {
+      selectedIDs.subtract(result.completedIDs)
+      selectedIDs.formIntersection(Set(visibleItems.map(\.id)))
+    }
+  }
+
+  /// 业务作用：区分完整完成和中途失败，导出删源不明时不承诺未计数项目仍全部保留。
+  /// 参数说明：
+  /// - `action`：本次为复制或导出。
+  /// - `result`：实际完成身份及失败原因。
+  /// 返回：适合当前界面展示的脱敏说明，不产生结果弹窗。
+  private func systemSaveNotice(_ action: SystemSaveAction, result: VaultSystemSaveResult) -> String
+  {
+    if let failure = result.failure {
+      return
+        "已完成\(action.rawValue) \(result.completedIDs.count) / \(result.totalCount) 项。\(Self.message(failure))"
+    }
+    if action == .copy {
+      return "已按原名复制到系统，共 \(result.completedIDs.count) 项，保险箱内原件及文件夹密码保护继续保留。系统中的副本未加密。"
+    }
+    return "已按原名导出到系统，共 \(result.completedIDs.count) 项，并移除保险箱内原件。系统中的文件未加密。"
   }
 
   /// 业务作用：取消或结束请求时撤销全部临时复制证明，不影响当前目录的普通浏览权限。
   /// 参数说明：无。
   /// 返回：下一次复制必须重新建立事务并输入相关目录密码。
   private func cancelSystemCopy() {
-    pendingCopy?.session.revoke()
+    pendingCopy?.revoke()
     pendingCopy = nil
   }
 
