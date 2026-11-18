@@ -130,6 +130,18 @@ final class VaultModel: ObservableObject {
       }
     }
 
+    /// 业务作用：标识仅整理当前列表的动作，避免将会话轮换误当作导航。
+    /// 参数说明：无。
+    /// 返回：移动或改名为真，访问、删除与系统导出保持各自呈现规则。
+    var preservesListing: Bool {
+      switch self {
+      case .move, .movePath, .rename:
+        return true
+      default:
+        return false
+      }
+    }
+
     /// 业务作用：识别需要统一结束目标验证与显示移动错误的动作。
     /// 参数说明：无。
     /// 返回：单项或批量移动时为真，其它目录动作不受此错误呈现规则影响。
@@ -1238,7 +1250,8 @@ final class VaultModel: ObservableObject {
     cancelMove()
     grant?.retainFolderAccess(currentFolderPathIDs)
     if cancelled {
-      clearThumbnails()
+      // 取消不会改变当前目录内容；保留仍可见的预览，正在读取的任务继续受路径授权约束。
+      retainCurrentThumbnails(unchangedFrom: items)
       message = nil
     }
   }
@@ -1254,9 +1267,9 @@ final class VaultModel: ObservableObject {
     guard closeViewer() else {
       return
     }
-    if action.isMove {
-      // 移动会撤销旧层级读取，先释放预览和排队解码，避免批次处理期间保留过期内容。
-      clearThumbnails()
+    if action.preservesListing {
+      // 整理会轮换读取能力；先撤销队列，当前已展示的内容待提交后按实际路径和元数据筛选。
+      cancelThumbnailWork()
     }
     cancelSystemCopy()
     pendingFolderAction = action
@@ -1324,7 +1337,7 @@ final class VaultModel: ObservableObject {
         case .move, .movePath:
           let result = try library.move(
             ids: action.sources.map(\.id), to: moveParentID,
-            authorization: moveSession, using: grant)
+            authorization: moveSession, retainingAccessTo: previousFolderID, using: grant)
           let replacement = result.grant
           do {
             let folderID: UUID?
@@ -1332,7 +1345,7 @@ final class VaultModel: ObservableObject {
               try library.nextLockedFolder(
                 id: previousFolderID, recursive: false, using: replacement) == nil
             {
-              // 范围内整理完成后保留原目录，避免重新进入时再要求已经有效的共同祖先密码。
+              // 来源目录的已有浏览证明已随会话转交；移动只改变所选条目，不导航到目标或根目录。
               try library.retainFolderAccess(to: previousFolderID, using: replacement)
               folderID = previousFolderID
             } else {
@@ -1355,13 +1368,15 @@ final class VaultModel: ObservableObject {
           let ordinaryFolder = media.isFolder && !media.isFilePackage
           let replacement: VaultGrant
           if ordinaryFolder {
-            replacement = try library.renameFolder(id: media.id, to: name, using: grant)
+            replacement = try library.renameFolder(
+              id: media.id, to: name, retainingParentAccess: true, using: grant)
           } else {
-            replacement = try library.renameFile(id: media.id, to: name, using: grant)
+            replacement = try library.renameFile(
+              id: media.id, to: name, retainingParentAccess: true, using: grant)
           }
           do {
             return FolderActionResult(
-              prompt: nil, folderID: nil, items: try library.list(using: replacement),
+              prompt: nil, folderID: previousFolderID, items: try library.list(using: replacement),
               message: ordinaryFolder
                 ? "已重命名文件夹，内容和原密码保持不变。" : "已重命名文件，内容、格式和所在目录保持不变。",
               replacement: replacement)
@@ -1402,6 +1417,7 @@ final class VaultModel: ObservableObject {
             moveDestinationID: result.moveDestinationID)
           return
         }
+        let previousItems = self.items
         self.items = result.items
         if action.isMove {
           self.endSelection()
@@ -1409,7 +1425,11 @@ final class VaultModel: ObservableObject {
         }
         self.currentFolderID = result.folderID
         self.grant?.retainFolderAccess(self.currentFolderPathIDs)
-        self.clearThumbnails()
+        if action.preservesListing && previousFolderID == result.folderID {
+          self.retainCurrentThumbnails(unchangedFrom: previousItems)
+        } else {
+          self.clearThumbnails()
+        }
         self.pendingFolderAction = nil
         self.folderPrompt = nil
         self.message = result.message
@@ -1963,7 +1983,7 @@ final class VaultModel: ObservableObject {
   /// 参数说明：
   /// - `folder`：当前可见且明确选中的普通文件夹。
   /// - `name`：用户手动确认的新名称。
-  /// 返回：未验证时打开密码表单，成功后回根目录并刷新名称，不改变密码或子项。
+  /// 返回：未验证时打开密码表单，成功后在原目录刷新名称，不改变密码或子项。
   func renameFolder(_ folder: VaultMedia, to name: String) {
     guard screen == .library, !busy, folder.isFolder, !folder.isFilePackage,
       visibleItems.contains(folder)
@@ -1977,7 +1997,7 @@ final class VaultModel: ObservableObject {
   /// 参数说明：
   /// - `media`：当前目录或查看页面明确选择的文件。
   /// - `name`：保留原扩展名的新名称。
-  /// 返回：编辑未退出时不执行；需要所属目录密码时先验证，成功后回根目录刷新名称并撤销旧读取。
+  /// 返回：编辑未退出时不执行；需要所属目录密码时先验证，成功后保留原目录并撤销旧读取。
   func renameFile(_ media: VaultMedia, to name: String) {
     // 改名会关闭查看并轮换会话，不能借此丢弃尚未由用户保存或确认退出的草稿。
     guard screen == .library, !busy, editingText == nil, !media.isFolder || media.isFilePackage,
@@ -2632,16 +2652,47 @@ final class VaultModel: ObservableObject {
     }
   }
 
-  /// 业务作用：撤销当前会话的缩略图任务与全部明文缓存，不留下访问顺序或预览文件。
+  /// 业务作用：停止旧读取能力关联的缩略图任务，不移除已经显示的内存预览。
   /// 参数说明：无。
-  /// 返回：队列与内存图片清空；旧任务受会话代次门禁约束，不能恢复缓存。
-  private func clearThumbnails() {
-    // 缓存代次独立于密码会话，使删除后的旧任务不能清空新队列或发布旧正文图像。
+  /// 返回：旧任务不能发布或清空新队列，后续可见项目按当前会话重新排队。
+  private func cancelThumbnailWork() {
+    // 代次独立于密码会话，避免已取消的旧任务影响后来建立的队列或正文预览。
     thumbnailGeneration &+= 1
     thumbnailWorker?.cancel()
     thumbnailWorker = nil
     thumbnailInFlight = nil
     thumbnailJobs = []
+  }
+
+  /// 业务作用：目录整理或取消验证后，仅保留当前可见且元数据未变化的预览。
+  /// 参数说明：
+  /// - `previousItems`：操作前已经认证的目录快照。
+  /// 返回：已移走、改动或失去浏览权的项目立即撤下，其余图片对象保持不变，不重新生成整页预览。
+  private func retainCurrentThumbnails(unchangedFrom previousItems: [VaultMedia]) {
+    let previous = Dictionary(
+      uniqueKeysWithValues: previousItems.map {
+        ($0.id, $0)
+      })
+    let unchanged = Set(
+      visibleItems.filter {
+        previous[$0.id] == $0
+      }.map(\.id))
+    thumbnails = thumbnails.filter {
+      unchanged.contains($0.key)
+    }
+    thumbnailOrder = thumbnailOrder.filter {
+      unchanged.contains($0)
+    }
+    thumbnailFailures = thumbnailFailures.filter {
+      unchanged.contains($0.key)
+    }
+  }
+
+  /// 业务作用：撤销当前会话的缩略图任务与全部明文缓存，不留下访问顺序或预览文件。
+  /// 参数说明：无。
+  /// 返回：队列与内存图片清空；旧任务受会话代次门禁约束，不能恢复缓存。
+  private func clearThumbnails() {
+    cancelThumbnailWork()
     thumbnailOrder = []
     thumbnails = [:]
     thumbnailFailures = [:]

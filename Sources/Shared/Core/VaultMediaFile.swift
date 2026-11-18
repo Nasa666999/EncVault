@@ -1002,16 +1002,31 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `grant`：当前 App 会话。
   /// - `uncertain`：撤销旧会话后无法确认提交时向界面交付的保护态原因。
   /// - `retainingSession`：仅照片呈现转换保持当前会话，禁止用于改变目录保护或父子关系。
-  /// 返回：完整校验后交付新会话，照片呈现转换沿用当前会话；发布前失败保留原件，发布不明时锁定。
+  /// - `retainedFolders`：改名后转交的原父路径浏览证明，不得超出提交前已经验证的路径。
+  /// 返回：完整校验后交付新会话及指定原路径证明，照片呈现转换沿用当前会话；发布不明时锁定。
   private func publishMetadata(
     _ media: VaultMedia, replacing original: VaultMedia, requirements: [UUID: UUID],
-    using grant: VaultGrant, uncertain: VaultError, retainingSession: Bool = false
+    using grant: VaultGrant, uncertain: VaultError, retainingSession: Bool = false,
+    retainedFolders: [UUID: UUID] = [:]
   ) throws -> VaultGrant {
     let id = original.id
     guard media.id == id, media.byteCount == original.byteCount,
       media.sha256 == original.sha256
     else {
       throw VaultError.corrupt
+    }
+    // 只有层级和保护未改变的改名可以保留原父路径，不能转交来源自身或无关目录的临时权限。
+    guard
+      retainedFolders.isEmpty
+        || (!retainingSession && original.parentID == media.parentID
+          && original.folderPassword == media.folderPassword && original.hidden == media.hidden
+          && original.contentType == media.contentType && original.photoAsset == media.photoAsset
+          && retainedFolders[original.id] == nil
+          && retainedFolders.allSatisfy({
+            requirements[$0.key] == $0.value
+          }))
+    else {
+      throw VaultError.invalidSelection
     }
     if retainingSession {
       guard original.isFolder, media.isFolder, media.photoAsset != nil,
@@ -1104,6 +1119,10 @@ final class VaultLibrary: @unchecked Sendable {
           throw VaultError.storage
         }
         try VaultStorage.synchronizeDirectory(store.mediaDirectory)
+      }
+      // 密文已完整发布后才恢复原父路径的已有浏览证明，旧读取器仍随会话轮换失效。
+      for (folderID, revision) in retainedFolders {
+        try replacement.allowFolder(folderID, revision: revision)
       }
       return replacement
     } catch {
@@ -1631,9 +1650,12 @@ final class VaultLibrary: @unchecked Sendable {
   /// 参数说明：
   /// - `id`：明确选择的普通文件夹。
   /// - `name`：新的单层名称，不能与同级项目重名。
+  /// - `retainingParentAccess`：是否转交原父路径的已有浏览权，不继承来源自身或其它目录权限。
   /// - `grant`：已验证该目录及其祖先的当前 App 会话。
-  /// 返回：名称发布后返回清空目录权限的新会话；非法名称、重名或未验证保护时保持原目录。
-  func renameFolder(id: UUID, to name: String, using grant: VaultGrant) throws -> VaultGrant {
+  /// 返回：名称发布后返回新会话，可保留原父路径浏览权；非法名称、重名或未验证保护时保持原目录。
+  func renameFolder(
+    id: UUID, to name: String, retainingParentAccess: Bool = false, using grant: VaultGrant
+  ) throws -> VaultGrant {
     mutation.lock()
     defer {
       mutation.unlock()
@@ -1666,18 +1688,24 @@ final class VaultLibrary: @unchecked Sendable {
       byteCount: 0, sha256: original.sha256, parentID: original.parentID,
       folderPassword: original.folderPassword, hidden: original.hidden,
       photoAsset: original.photoAsset)
+    let retained =
+      retainingParentAccess
+      ? try folderRequirements(for: original, includingSelf: false, using: grant) : [:]
     return try publishMetadata(
       media, replacing: original, requirements: requirements, using: grant,
-      uncertain: .organizationCommitUncertain)
+      uncertain: .organizationCommitUncertain, retainedFolders: retained)
   }
 
   /// 业务作用：更改普通文件或文档包的加密名称，保留内容、身份、格式与所在目录。
   /// 参数说明：
   /// - `id`：当前保险箱内明确选择的文件或文档包。
   /// - `name`：保留原扩展名的新单层名称，不得与同级项目重名。
+  /// - `retainingParentAccess`：是否转交原父路径的已有浏览权，不继承其它目录权限。
   /// - `grant`：已验证所属保护目录的当前会话。
-  /// 返回：完整密文发布后返回新会话；名称非法、内容损坏、取消或未授权时不替换原件。
-  func renameFile(id: UUID, to name: String, using grant: VaultGrant) throws -> VaultGrant {
+  /// 返回：完整密文发布后返回新会话及指定原父路径浏览权；名称非法、内容损坏、取消或未授权时不替换原件。
+  func renameFile(
+    id: UUID, to name: String, retainingParentAccess: Bool = false, using grant: VaultGrant
+  ) throws -> VaultGrant {
     mutation.lock()
     defer {
       mutation.unlock()
@@ -1716,9 +1744,12 @@ final class VaultLibrary: @unchecked Sendable {
       byteCount: original.byteCount, sha256: original.sha256, parentID: original.parentID,
       folderPassword: original.folderPassword, hidden: original.hidden,
       photoAsset: original.photoAsset)
+    let retained =
+      retainingParentAccess
+      ? try folderRequirements(for: original, includingSelf: false, using: grant) : [:]
     return try publishMetadata(
       media, replacing: original, requirements: requirements, using: grant,
-      uncertain: .organizationCommitUncertain)
+      uncertain: .organizationCommitUncertain, retainedFolders: retained)
   }
 
   /// 业务作用：按保险箱虚拟绝对路径定位移动目标，逐层验证保护，不访问同名系统路径。
@@ -1943,11 +1974,12 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `ids`：当前批次明确选择且不重复的来源身份。
   /// - `parentID`：统一接收目录；为空时接收至保险箱根目录。
   /// - `authorization`：文件移出任一来源保护层时必须提供本次重新验证的单次证明。
+  /// - `browsingFolderID`：需要继续浏览的来源父目录，只能保留移动前已经有效的路径证明。
   /// - `grant`：已验证来源与目标密码的当前会话。
-  /// 返回：新会话、完成数量和中途失败说明；预检失败不移动任何条目，中途失败保留已完成项及其余原件。
+  /// 返回：新会话、完成数量和中途失败说明；保留指定来源父目录的已有浏览权，临时移动与额外目标证明不继承。
   func move(
     ids: [UUID], to parentID: UUID?, authorization: VaultMoveSession? = nil,
-    using grant: VaultGrant
+    retainingAccessTo browsingFolderID: UUID? = nil, using grant: VaultGrant
   ) throws -> VaultBatchMoveResult {
     mutation.lock()
     defer {
@@ -1958,6 +1990,20 @@ final class VaultLibrary: @unchecked Sendable {
     }
     defer {
       authorization?.revoke()
+    }
+    // 浏览证明必须在移动授权转入前复验，不能把本次移出验证或额外目标权限当作原有浏览权。
+    let browsingProtection: [UUID: UUID]
+    if let browsingFolderID {
+      let folder = try rawReader(id: browsingFolderID, using: grant).media
+      guard folder.isFolder, !folder.isFilePackage else {
+        throw VaultError.invalidFolder
+      }
+      browsingProtection = try folderRequirements(for: folder, includingSelf: true, using: grant)
+      try grant.access(folders: browsingProtection) { _ in
+        ()
+      }
+    } else {
+      browsingProtection = [:]
     }
     let permission: VaultGrant?
     if let authorization {
@@ -1997,6 +2043,14 @@ final class VaultLibrary: @unchecked Sendable {
       try prepareMove(id: $0, to: parentID, using: grant)
     }
     let sourceParent = plans[0].media.parentID
+    // 仅允许保留实际来源父目录，防止调用方借移动把无关目录的临时证明带入后续浏览。
+    guard browsingFolderID == nil || browsingFolderID == sourceParent else {
+      throw VaultError.invalidMove
+    }
+    var preservedProtection = sharedProtection
+    preservedProtection.merge(browsingProtection) { original, _ in
+      original
+    }
     var names: [String] = []
     var authorization: [UUID: UUID] = [:]
     for plan in plans {
@@ -2020,8 +2074,8 @@ final class VaultLibrary: @unchecked Sendable {
     var moved = 0
     defer {
       if moved > 0 {
-        // 发布后只保留来源与目标共有的保护层；离开范围的证明和目标额外权限不能留给后续浏览。
-        current.retainFolderAccess(Set(sharedProtection.keys))
+        // 发布后只保留共同保护层和移动前已验证的来源浏览路径，临时移出与额外目标证明到此撤销。
+        current.retainFolderAccess(Set(preservedProtection.keys))
       }
     }
     for id in ids {
@@ -2036,8 +2090,8 @@ final class VaultLibrary: @unchecked Sendable {
         }
         current = try moveEntry(id: id, to: parentID, using: current)
         moved += 1
-        // 新会话不继承目录证明；仅转交本批仍保持原保护关系的共同层，避免范围内整理后被迫重新进入。
-        for (folderID, revision) in sharedProtection {
+        // 新会话仍撤销旧读取器，只转交已有浏览路径和共同保护层，使当前列表继续可用。
+        for (folderID, revision) in preservedProtection {
           try current.allowFolder(folderID, revision: revision)
         }
       } catch {
