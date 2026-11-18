@@ -350,7 +350,7 @@ struct VaultLandingView: View {
               #if os(iOS)
                 .textInputAutocapitalization(.never)
               #endif
-            Text("只移动到已存在的目录；有保护密码时继续验证。")
+            Text("只移动到已存在的目录；目标尚未授权时验证其保护密码。")
               .font(.caption).foregroundStyle(.secondary)
             Button("移动") {
               pendingMovePath = (media, movePath)
@@ -590,11 +590,17 @@ struct VaultLandingView: View {
       })
   }
 
-  /// 业务作用：在统一缩略图相册和当前媒体查看之间切换，保持独立密码会话边界。
+  /// 业务作用：在当前目录上呈现文件查看，保留返回时的列表位置和独立密码会话边界。
   /// 参数说明：无。
-  /// 返回：未选择时显示相册网格；选择后让图片和视频占满查看区，不堆叠多行标题栏。
+  /// 返回：所有文件关闭查看后回到原列表位置；锁定时目录与查看界面一起撤下。
   private var library: some View {
-    Group {
+    ZStack {
+      // 查看期间保留同一目录视图及滚动容器，但关闭其输入和辅助访问，防止操作落到遮挡的列表。
+      libraryListing
+        .opacity(model.selected == nil ? 1 : 0)
+        .allowsHitTesting(model.selected == nil)
+        .accessibilityHidden(model.selected != nil)
+        .disabled(model.selected != nil)
       if let media = model.selected {
         if media.isImage || media.isVideo {
           VaultMediaBrowser(
@@ -606,34 +612,39 @@ struct VaultLandingView: View {
         } else {
           fileDetails(media)
         }
+      }
+    }
+  }
+
+  /// 业务作用：为当前解锁目录提供持续存在的文件列表，不因打开图片、视频或文档而重建。
+  /// 参数说明：无。
+  /// 返回：包含目录操作、网格及当前任务提示的列表，滚动状态仅保留在本次解锁界面内。
+  private var libraryListing: some View {
+    VStack(spacing: 4) {
+      libraryToolbar
+      if model.visibleItems.isEmpty {
+        Spacer()
+        Image(systemName: "photo.on.rectangle.angled").font(.largeTitle).foregroundStyle(
+          .secondary)
+        Text(model.currentFolderID == nil ? "保险箱为空" : "文件夹为空").font(.title2)
+        Text("导入文件或整个文件夹，解锁后查看。")
+          .font(.callout).foregroundStyle(.secondary)
+        Spacer()
       } else {
-        VStack(spacing: 4) {
-          libraryToolbar
-          if model.visibleItems.isEmpty {
-            Spacer()
-            Image(systemName: "photo.on.rectangle.angled").font(.largeTitle).foregroundStyle(
-              .secondary)
-            Text(model.currentFolderID == nil ? "保险箱为空" : "文件夹为空").font(.title2)
-            Text("导入文件或整个文件夹，解锁后查看。")
-              .font(.callout).foregroundStyle(.secondary)
-            Spacer()
-          } else {
-            VaultAlbumGrid(
-              model: model,
-              actions: {
-                mediaActionItems($0)
-              })
-          }
-          if model.selecting {
-            selectionControls
-          }
-          if model.busy {
-            importStatus
-          }
-          if let message = model.message {
-            Text(message).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12)
-          }
-        }
+        VaultAlbumGrid(
+          model: model,
+          actions: {
+            mediaActionItems($0)
+          })
+      }
+      if model.selecting {
+        selectionControls
+      }
+      if model.busy {
+        importStatus
+      }
+      if let message = model.message {
+        Text(message).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12)
       }
     }
   }
@@ -959,7 +970,7 @@ struct VaultLandingView: View {
         Text("所选项目含密码保护文件夹，请先取消保护后再移动或删除。")
           .font(.caption).foregroundStyle(.secondary)
       } else if !model.selectedItems.isEmpty && !model.canDeleteSelection {
-        Text("所选项目受文件夹密码保护，不能删除；移动需重新验证来源文件夹密码。")
+        Text("所选项目受文件夹密码保护，不能删除；移出保护范围需验证来源文件夹密码。")
           .font(.caption).foregroundStyle(.secondary)
       }
     }

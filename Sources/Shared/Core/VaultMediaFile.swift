@@ -384,7 +384,7 @@ final class VaultCopySession: @unchecked Sendable {
   }
 }
 
-/// 一批来源文件的单次移动证明，与当前浏览权限独立。
+/// 一批来源文件移出保护范围时的单次证明，范围内整理只借用仍有效的浏览权限。
 final class VaultMoveSession: @unchecked Sendable {
   let mediaIDs: [UUID]
   private let owner: VaultLibrary
@@ -392,13 +392,15 @@ final class VaultMoveSession: @unchecked Sendable {
   private let grant: VaultGrant
   private let mutex = NSLock()
   private var available = true
+  private var destinationBound = false
+  private var destinationID: UUID?
 
   /// 业务作用：为明确选择的移动来源建立没有旧目录证明的临时能力。
   /// 参数说明：
   /// - `mediaIDs`：本次批次唯一允许移动的来源身份。
   /// - `owner`：创建本次移动的保险箱入口。
   /// - `parent`：本次仍有效的 App 会话。
-  /// 返回：依赖 App 会话的内存能力，不继承浏览时输入的密码。
+  /// 返回：依赖 App 会话的空能力，后续只可借用共同保护范围的有效浏览证明。
   fileprivate init(mediaIDs: [UUID], owner: VaultLibrary, parent: VaultGrant) throws {
     self.mediaIDs = mediaIDs
     self.owner = owner
@@ -406,6 +408,27 @@ final class VaultMoveSession: @unchecked Sendable {
     grant = try parent.access { root in
       VaultGrant(root: root, vaultID: parent.vaultID, parent: parent)
     }
+  }
+
+  /// 业务作用：把范围判断与本次唯一目标绑定，防止范围内借用的浏览证明被改用于移出。
+  /// 参数说明：
+  /// - `id`：本次接收目录身份，空值表示保险箱根目录。
+  /// - `owner`：执行本次移动的保险箱入口。
+  /// - `parent`：创建本次证明的同一 App 会话。
+  /// 返回：首次绑定或目标未变时成功；目标改变、归属错配、取消或消费后拒绝。
+  fileprivate func bindDestination(_ id: UUID?, owner: VaultLibrary, parent: VaultGrant) throws {
+    mutex.lock()
+    defer {
+      mutex.unlock()
+    }
+    // 共同范围的浏览证明不等于移出授权，同一证明不能先借用后改换接收目录。
+    guard available, self.owner === owner, self.parent === parent,
+      !destinationBound || destinationID == id
+    else {
+      throw VaultError.invalidMove
+    }
+    destinationID = id
+    destinationBound = true
   }
 
   /// 业务作用：核对移动证明的归属，并在实际移动前一次性消费证明。
@@ -1797,7 +1820,7 @@ final class VaultLibrary: @unchecked Sendable {
     return (original, requirements)
   }
 
-  /// 业务作用：为一批明确来源建立独立的移动验证，不沿用浏览密码证明。
+  /// 业务作用：为一批明确来源建立单次移动证明，将移出保护范围的验证与浏览隔离。
   /// 参数说明：
   /// - `ids`：本次明确选定且不重复的来源身份。
   /// - `grant`：仍有效的 App 会话。
@@ -1810,21 +1833,67 @@ final class VaultLibrary: @unchecked Sendable {
     return try VaultMoveSession(mediaIDs: ids, owner: self, parent: grant)
   }
 
-  /// 业务作用：按来源路径查找本次移动尚需重新验证的保护密码。
+  /// 业务作用：认证移动目标的保护路径，供来源与目标比较密码保护范围。
+  /// 参数说明：
+  /// - `parentID`：本次接收目录身份；为空时表示保险箱根目录。
+  /// - `grant`：当前仍有效的 App 会话。
+  /// 返回：目标及其祖先的密码代次；非普通目录、隐藏路径失权或元数据异常时拒绝。
+  private func moveDestinationProtection(to parentID: UUID?, using grant: VaultGrant) throws
+    -> [UUID: UUID]
+  {
+    try store.authorize(grant)
+    guard let parentID else {
+      return [:]
+    }
+    let parent = try rawReader(id: parentID, using: grant).media
+    // 文档包与照片内部目录不能成为整理目标，避免把文件写入不可见的内部资源树。
+    guard parent.isFolder, !parent.isFilePackage else {
+      throw VaultError.invalidMove
+    }
+    return try folderRequirements(for: parent, includingSelf: true, using: grant)
+  }
+
+  /// 业务作用：仅对本次移动将离开的保护层要求独立来源验证，共同保护层复验当前浏览权。
   /// 参数说明：
   /// - `session`：本次明确来源的单次移动证明。
+  /// - `parentID`：本次接收目录；为空时移至保险箱根目录。
   /// - `grant`：创建该证明的同一 App 会话。
-  /// 返回：外层优先的下一项密码目录；所有来源均已验证时为空。
-  func nextMoveFolder(_ session: VaultMoveSession, using grant: VaultGrant) throws -> VaultMedia? {
+  /// 返回：外层优先的下一项待验证保护目录；范围内权限有效且离开的保护层均已验证时为空。
+  func nextMoveFolder(
+    _ session: VaultMoveSession, to parentID: UUID? = nil, using grant: VaultGrant
+  ) throws -> VaultMedia? {
     mutation.lock()
     defer {
       mutation.unlock()
     }
     try store.authorize(grant)
+    try session.bindDestination(parentID, owner: self, parent: grant)
     let permission = try session.permission(owner: self, parent: grant)
+    let destination = try moveDestinationProtection(to: parentID, using: grant)
     for id in session.mediaIDs {
-      if let folder = try nextLockedFolder(id: id, recursive: false, using: permission) {
-        return folder
+      let source = try rawReader(id: id, using: grant).media
+      let path = try folderChain(for: source, includingSelf: true, using: grant)
+      _ = try rootRequirement(in: path, using: grant)
+      for folder in path {
+        guard let protection = folder.folderPassword else {
+          continue
+        }
+        let requirement = [folder.id: protection.revision]
+        if destination[folder.id] == protection.revision {
+          // 共同祖先仍保护移动后的文件；只借用当前有效的浏览证明，不能凭目标位于范围内直接授权。
+          try grant.access(folders: requirement) { _ in
+            ()
+          }
+          try permission.allowFolder(folder.id, revision: protection.revision)
+        } else {
+          do {
+            try permission.access(folders: requirement) { _ in
+              ()
+            }
+          } catch VaultError.folderPasswordRequired {
+            return folder
+          }
+        }
       }
     }
     return nil
@@ -1835,17 +1904,19 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `id`：当前要求验证的目录身份。
   /// - `password`：本次重新输入的独立目录密码。
   /// - `session`：本次明确来源的单次移动证明。
+  /// - `parentID`：本次接收目录；为空时移至保险箱根目录。
   /// - `grant`：创建该证明的同一 App 会话。
   /// 返回：正确时增加本次移动证明；错配、错误密码或失权时不开始移动。
   func authenticateMoveFolder(
-    id: UUID, password: String, session: VaultMoveSession, using grant: VaultGrant
+    id: UUID, password: String, session: VaultMoveSession, to parentID: UUID? = nil,
+    using grant: VaultGrant
   ) throws {
     mutation.lock()
     defer {
       mutation.unlock()
     }
     // 来源密码必须逐层验证，不能跳过祖先或用无关目录的密码扩大移动权限。
-    guard try nextMoveFolder(session, using: grant)?.id == id else {
+    guard try nextMoveFolder(session, to: parentID, using: grant)?.id == id else {
       throw VaultError.invalidFolder
     }
     try authenticateFolder(
@@ -1857,7 +1928,7 @@ final class VaultLibrary: @unchecked Sendable {
   /// 参数说明：
   /// - `ids`：当前批次明确选择且不重复的来源身份。
   /// - `parentID`：统一接收目录；为空时接收至保险箱根目录。
-  /// - `authorization`：受保护文件来源必须提供本次重新验证的单次证明。
+  /// - `authorization`：文件移出任一来源保护层时必须提供本次重新验证的单次证明。
   /// - `grant`：已验证来源与目标密码的当前会话。
   /// 返回：新会话、完成数量和中途失败说明；预检失败不移动任何条目，中途失败保留已完成项及其余原件。
   func move(
@@ -1876,7 +1947,8 @@ final class VaultLibrary: @unchecked Sendable {
     }
     let permission: VaultGrant?
     if let authorization {
-      guard authorization.mediaIDs == ids, try nextMoveFolder(authorization, using: grant) == nil
+      guard authorization.mediaIDs == ids,
+        try nextMoveFolder(authorization, to: parentID, using: grant) == nil
       else {
         throw VaultError.invalidMove
       }
@@ -1884,20 +1956,27 @@ final class VaultLibrary: @unchecked Sendable {
     } else {
       permission = nil
     }
+    let destination = try moveDestinationProtection(to: parentID, using: grant)
+    var sharedProtection = destination
     for id in ids {
       let source = try rawReader(id: id, using: grant).media
       let requirements = try folderRequirements(for: source, includingSelf: true, using: grant)
-      if !source.isFolder || source.isFilePackage, let protectedID = requirements.keys.first {
-        // 浏览授权不能替代本次移动验证，文件移出保护范围前必须取得独立来源证明。
+      sharedProtection = sharedProtection.filter { requirements[$0.key] == $0.value }
+      let leaving = requirements.filter { destination[$0.key] != $0.value }
+      if !source.isFolder || source.isFilePackage, let protectedID = leaving.keys.first {
+        // 仅越过的保护层必须重新验证；仍留在共同保护范围内的文件继续受原目录密码约束。
         guard let permission else {
           throw VaultError.folderPasswordRequired(protectedID)
         }
-        try permission.access(folders: requirements) { _ in
+        try permission.access(folders: leaving) { _ in
           ()
         }
-        for (folderID, revision) in requirements {
+        for (folderID, revision) in leaving {
           try grant.allowFolder(folderID, revision: revision)
         }
+      }
+      try grant.access(folders: requirements) { _ in
+        ()
       }
     }
     let plans = try ids.map {
@@ -1927,7 +2006,8 @@ final class VaultLibrary: @unchecked Sendable {
     var moved = 0
     defer {
       if moved > 0 {
-        current.retainFolderAccess([])
+        // 发布后只保留来源与目标共有的保护层；离开范围的证明和目标额外权限不能留给后续浏览。
+        current.retainFolderAccess(Set(sharedProtection.keys))
       }
     }
     for id in ids {
@@ -1942,6 +2022,10 @@ final class VaultLibrary: @unchecked Sendable {
         }
         current = try moveEntry(id: id, to: parentID, using: current)
         moved += 1
+        // 新会话不继承目录证明；仅转交本批仍保持原保护关系的共同层，避免范围内整理后被迫重新进入。
+        for (folderID, revision) in sharedProtection {
+          try current.allowFolder(folderID, revision: revision)
+        }
       } catch {
         // 发布结果不明必须保持底层保护态，不能把未知结果计为普通部分完成。
         if case VaultError.organizationCommitUncertain = error {
@@ -1974,8 +2058,8 @@ final class VaultLibrary: @unchecked Sendable {
   /// - `id`：明确选中的来源文件或未受密码保护的目录树。
   /// - `parentID`：接收目录；为空时移至保险箱根目录。
   /// - `grant`：具有来源及目标目录访问权的当前会话。
-  /// - `authorization`：受保护文件来源必须提供本次重新验证的单次证明。
-  /// 返回：移动发布后撤销旧读取并交付新会话；未验证来源、受保护目录树、循环或重名时拒绝。
+  /// - `authorization`：文件移出任一来源保护层时必须提供本次重新验证的单次证明。
+  /// 返回：移动发布后撤销旧读取并交付新会话；范围内复验浏览权，缺少移出证明、受保护目录树、循环或重名时拒绝。
   func move(
     id: UUID, to parentID: UUID?, authorization: VaultMoveSession? = nil, using grant: VaultGrant
   ) throws -> VaultGrant {

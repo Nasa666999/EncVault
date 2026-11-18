@@ -1116,7 +1116,7 @@ struct FolderPasswordForm: View {
         Text("仅授权本次解密复制，保险箱内的密码保护保持不变。嵌套受保护目录需要分别验证。")
           .font(.caption).foregroundStyle(.secondary)
       } else if prompt.kind == .moveSource {
-        Text("重新验证来源文件夹密码后才会移动。文件移入其它目录后，按目标目录的保护规则访问。取消或密码不正确时，来源保持原位。")
+        Text("本次移动将离开此文件夹的保护范围，需要重新验证其密码。移入后按目标目录的保护规则访问。取消或密码不正确时，来源保持原位。")
           .font(.caption).foregroundStyle(.secondary)
       } else if prompt.kind == .move {
         Text("验证目标文件夹密码后才会移入。取消或密码不正确时，来源保持原位。")

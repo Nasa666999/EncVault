@@ -66,6 +66,7 @@ final class VaultModel: ObservableObject {
     let challengeID = UUID()
     let folder: VaultMedia
     let kind: Kind
+    var moveDestinationID: UUID? = nil
   }
 
   struct MoveSelection: Identifiable {
@@ -140,6 +141,7 @@ final class VaultModel: ObservableObject {
     var replacement: VaultGrant? = nil
     var moveFailure: String? = nil
     var moveSourcePrompt = false
+    var moveDestinationID: UUID? = nil
   }
 
   @Published var screen: Screen = .unavailable
@@ -883,12 +885,12 @@ final class VaultModel: ObservableObject {
   /// 参数说明：
   /// - `media`：选中的文件或无密码目录树。
   /// - `parentID`：用户明确选择的接收目录。
-  /// 返回：先重新验证受保护来源，再验证必要的目标密码；始终不解密导出到系统。
+  /// 返回：范围内沿用有效浏览权限，移出保护范围时验证来源密码；目标仍单独检查，不解密导出到系统。
   func move(_ media: VaultMedia, to parentID: UUID?) {
     move([media], to: parentID)
   }
 
-  /// 业务作用：对同一批明确来源开启统一目标移动，来源保护密码在本次批次重新验证。
+  /// 业务作用：对同一批明确来源开启统一目标移动，仅重新验证本次离开的来源保护范围。
   /// 参数说明：
   /// - `media`：本次选定的文件与普通目录。
   /// - `parentID`：全部项目共用的接收目录。
@@ -971,7 +973,7 @@ final class VaultModel: ObservableObject {
     cancelMove()
     do {
       pendingMove = try library.beginMove(ids: action.sources.map(\.id), using: grant)
-      // 浏览路径授权保留以支持取消；来源密码由独立移动证明重新验证，旧目标权限不继承。
+      // 当前路径权限支持范围内整理和取消；离开范围的来源密码由独立移动证明验证，旧目标权限不继承。
       grant.retainFolderAccess(currentFolderPathIDs)
       runFolderAction(action)
     } catch {
@@ -981,7 +983,7 @@ final class VaultModel: ObservableObject {
 
   /// 业务作用：撤销已结束或取消移动的来源密码证明，不影响当前目录浏览。
   /// 参数说明：无。
-  /// 返回：下一次移动必须重新验证相关来源密码。
+  /// 返回：下一次移出保护范围仍需独立验证，范围内整理依赖当前路径权限。
   private func cancelMove() {
     pendingMove?.revoke()
     pendingMove = nil
@@ -1117,7 +1119,8 @@ final class VaultModel: ObservableObject {
       perform(
         {
           try library.authenticateMoveFolder(
-            id: prompt.folder.id, password: password, session: session, using: grant)
+            id: prompt.folder.id, password: password, session: session,
+            to: prompt.moveDestinationID, using: grant)
         },
         success: { [weak self] in
           guard let self, self.folderPrompt?.challengeID == prompt.challengeID,
@@ -1195,7 +1198,7 @@ final class VaultModel: ObservableObject {
     }
   }
 
-  /// 业务作用：访问及移动前验证对应目录密码，移动来源单独验证，导出与删除执行保护限制。
+  /// 业务作用：访问及移动前验证对应目录密码，只对移出的来源保护范围单独验证。
   /// 参数说明：
   /// - `action`：用户明确选择且已完成外层确认的目录或文件操作。
   /// 返回：来源或目标缺少证明时等待验证；移动后撤销旧层级能力，失败不放开保护。
@@ -1218,15 +1221,6 @@ final class VaultModel: ObservableObject {
     perform(
       {
         var moveParentID: UUID?
-        if action.isMove {
-          guard let moveSession else {
-            throw VaultError.invalidMove
-          }
-          if let locked = try library.nextMoveFolder(moveSession, using: grant) {
-            return FolderActionResult(
-              prompt: locked, folderID: nil, items: [], message: nil, moveSourcePrompt: true)
-          }
-        }
         // 删除和导出不能把访问密码当作取消保护；移入受保护目标则必须先取得该目录访问权。
         switch action {
         case .delete, .export:
@@ -1251,6 +1245,17 @@ final class VaultModel: ObservableObject {
           }
           moveParentID = target.id
         }
+        if action.isMove {
+          guard let moveSession else {
+            throw VaultError.invalidMove
+          }
+          // 目标完整解析并通过访问门禁后，才能按认证目录身份判断本次是否离开来源保护范围。
+          if let locked = try library.nextMoveFolder(moveSession, to: moveParentID, using: grant) {
+            return FolderActionResult(
+              prompt: locked, folderID: nil, items: [], message: nil,
+              moveSourcePrompt: true, moveDestinationID: moveParentID)
+          }
+        }
         let folderID: UUID?
         let notice: String?
         switch action {
@@ -1272,11 +1277,22 @@ final class VaultModel: ObservableObject {
             authorization: moveSession, using: grant)
           let replacement = result.grant
           do {
+            let folderID: UUID?
+            if let previousFolderID,
+              try library.nextLockedFolder(
+                id: previousFolderID, recursive: false, using: replacement) == nil
+            {
+              // 范围内整理完成后保留原目录，避免重新进入时再要求已经有效的共同祖先密码。
+              try library.retainFolderAccess(to: previousFolderID, using: replacement)
+              folderID = previousFolderID
+            } else {
+              folderID = nil
+            }
             let notice = result.failure.map {
               "已移动 \(result.movedCount) / \(result.totalCount) 项，其余项目保留原位。\(Self.message($0))"
             }
             return FolderActionResult(
-              prompt: nil, folderID: nil,
+              prompt: nil, folderID: folderID,
               items: try library.list(using: replacement),
               message: notice ?? "已移动 \(result.movedCount) 项，文件名和内容保持不变。",
               replacement: replacement,
@@ -1332,7 +1348,8 @@ final class VaultModel: ObservableObject {
             kind = .access
           }
           self.folderPrompt = FolderPrompt(
-            id: self.folderPrompt?.id ?? UUID(), folder: folder, kind: kind)
+            id: self.folderPrompt?.id ?? UUID(), folder: folder, kind: kind,
+            moveDestinationID: result.moveDestinationID)
           return
         }
         self.items = result.items
