@@ -525,8 +525,10 @@ struct VaultLandingView: View {
         ) {
           chooseFiles(for: .systemDirectory)
         }
-        if let media = systemSaveMedia, media.isImage || media.isVideo {
-          Button(systemSaveAction == .copy ? "复制到系统照片" : "保存到系统照片") {
+        if let media = systemSaveMedia, media.isImage || media.isVideo,
+          systemSaveAction == .copy || media.photoAsset == nil
+        {
+          Button(systemSaveAction == .copy ? "复制到系统照片" : "导出到系统照片并移除原件") {
             switch systemSaveAction {
             case .copy:
               model.copyToPhotos(media)
@@ -549,11 +551,13 @@ struct VaultLandingView: View {
         #endif
       } message: {
         Text(
-          systemSaveMedia?.photoAsset != nil
-            ? "选择系统照片会保存主图片或主视频；选择本地目录会完整保存全部原始及配套资源。保险箱内原件继续保留，保护规则保持不变。系统副本未加密，可能按系统设置同步或备份。"
-            : systemSaveAction == .copy
-              ? "按原名生成未加密副本，保险箱内原件继续保留，密码保护不变。受保护目录每次复制需重新验证，文件夹包含全部内容。系统副本可能按系统设置同步或备份。"
-              : "按原名保存未加密副本，保险箱内原件继续保留。受保护内容需先取消目录密码。系统副本可能按系统设置同步或备份。"
+          systemSaveAction == .copy
+            ? systemSaveMedia?.photoAsset != nil
+              ? "复制到系统照片只保存主图片或主视频；复制到本地目录会保存全部配套资源。保险箱内原件继续保留，保护规则保持不变。系统副本未加密，可能按系统设置同步或备份。"
+              : "按原名生成未加密副本，保险箱内原件继续保留，密码保护不变。受保护目录每次复制需重新验证，文件夹包含全部内容。系统副本可能按系统设置同步或备份。"
+            : systemSaveMedia?.photoAsset != nil
+              ? "导出到本地目录会完整保存全部照片资源，完整校验成功后删除保险箱内原件。系统相册单资源入口不用于此类导出。受保护内容需先取消目录密码。系统文件未加密，可能按系统设置同步或备份。"
+              : "按原名保存到系统，完整校验成功后删除保险箱内原件。受保护内容需先取消目录密码。系统文件未加密，可能按系统设置同步或备份。"
         )
       }
       .confirmationDialog("加密保存并复验完成", isPresented: $sourceConfirmation) {
@@ -1250,7 +1254,7 @@ struct VaultLandingView: View {
   /// 业务作用：让文件详情与两端的文件操作菜单都提供独立的复制与导出入口。
   /// 参数说明：
   /// - `media`：本次明确选择的文件或完整目录。
-  /// 返回：复制允许重新验证目录密码，导出保留禁止受保护内容的门禁；两者均需明确选择系统目标。
+  /// 返回：复制保留原件，导出完整校验后删源并禁止受保护内容；两者均需明确选择系统目标。
   private func systemSaveButtons(_ media: VaultMedia) -> some View {
     VaultMediaMenu(items: systemSaveItems(media))
   }
@@ -1258,11 +1262,12 @@ struct VaultLandingView: View {
   /// 业务作用：统一系统复制与导出的确认入口，不把菜单显示当作目录密码授权。
   /// 参数说明：
   /// - `media`：待复制或导出的完整条目。
-  /// 返回：复制保留独立验证、导出保持保护门禁的两个动作，执行后仍需选择目标。
+  /// 返回：复制保留原件与独立验证；导出提示删源并保持保护门禁，执行前仍需选择目标。
   private func systemSaveItems(_ media: VaultMedia) -> [VaultMediaMenuItem] {
     SystemSaveAction.allCases.map { action in
       VaultMediaMenuItem(
         title: action.title,
+        destructive: action == .export,
         enabled: !model.busy && (action == .copy || !model.exportRestricted(media)),
         action: {
           guard model.screen == .library, !model.busy,

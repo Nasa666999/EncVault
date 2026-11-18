@@ -2329,13 +2329,13 @@ final class VaultLibrary: @unchecked Sendable {
     return (deleted, ids.count, nil)
   }
 
-  /// 业务作用：按原名逐块解密导出到用户选择的位置，验证完整内容后才发布明文。
+  /// 业务作用：按原名完整导出并校验本地副本，持久发布成功后移除保险箱原件。
   /// 参数说明：
   /// - `id`：需要导出的媒体身份。
   /// - `directory`：用户明确授权的本地目标目录。
   /// - `grant`：当前独立密码会话。
   /// - `progress`：仅用于当前界面的导出进度。
-  /// 返回：目标、祖先及子目录均无密码保护且完整验证后发布明文；拒绝时保留密文，不生成导出副本。
+  /// 返回：无密码保护、系统副本完整发布且密文移除后交付目标路径；写入失败保留密文，发布后清理不明时明确报告。
   func export(
     id: UUID, to directory: URL, using grant: VaultGrant,
     progress: @Sendable (Double) -> Void = { _ in }
@@ -2356,21 +2356,37 @@ final class VaultLibrary: @unchecked Sendable {
     else {
       throw VaultError.protectedFolderExport
     }
-    return try materialize(id: id, to: directory, using: grant, progress: progress)
+    let destination = try materialize(id: id, to: directory, using: grant) { fraction in
+      progress(fraction * 0.95)
+    }
+    do {
+      // 只有全部外部字节复验并持久发布后才能删源；同一目录互斥内重新检查保护，复制和私有预览不经过此分支。
+      try Task.checkCancellation()
+      try delete(id: id, using: grant)
+    } catch {
+      // 副本已经发布，清理失败或失权不能回滚系统副本，也不能声称保险箱原件已全部移除。
+      throw VaultError.exportRemovalUncertain
+    }
+    progress(1)
+    return destination
   }
 
-  /// 业务作用：向系统照片交付主图片或主视频，配套资源继续完整保留在保险箱内。
+  /// 业务作用：为系统相册导出准备经过校验的单一媒体暂存，系统提交前不删除保险箱原件。
   /// 参数说明：
   /// - `id`：明确选择的媒体或完整照片身份。
   /// - `directory`：本次相册写入独占的私有暂存目录。
   /// - `grant`：当前会话；原有禁止导出受保护内容的规则继续成立。
-  /// 返回：主媒体文件已经完整复验；受保护路径或完整资源中有保护目录时拒绝。
+  /// 返回：单一图片或视频已经完整复验；复合资源或受保护路径拒绝，全部原件保持不变。
   func exportPresentation(id: UUID, to directory: URL, using grant: VaultGrant) throws -> URL {
     mutation.lock()
     defer {
       mutation.unlock()
     }
     let media = try reader(id: id, using: grant).media
+    // 单张主图不能代表 Live Photo、RAW 或编辑资产的全部资源，删源导出必须改用完整本地资源包。
+    guard !media.isFolder, media.photoAsset == nil, media.isImage || media.isVideo else {
+      throw VaultError.compositePhoto
+    }
     let ancestors = try folderChain(for: media, includingSelf: true, using: grant)
     let entries = media.isFolder ? try descendantEntries(of: media, using: grant) : [media]
     guard !(ancestors + entries).contains(where: { $0.folderPassword != nil }) else {
@@ -2378,6 +2394,28 @@ final class VaultLibrary: @unchecked Sendable {
     }
     let primary = try presentationReader(id: id, using: grant).media
     return try materialize(id: primary.id, to: directory, using: grant, progress: { _ in })
+  }
+
+  /// 业务作用：系统相册完整提交并复验后，只移除与本次导出快照一致的单一媒体原件。
+  /// 参数说明：
+  /// - `expected`：提交系统相册前取得的已认证图片或视频元数据。
+  /// - `grant`：导出开始时的同一有效会话。
+  /// 返回：身份、内容和保护均未变化时删除密文；改动、失权或仍有保护时拒绝删除。
+  func removeExportedPhoto(_ expected: VaultMedia, using grant: VaultGrant) throws {
+    mutation.lock()
+    defer {
+      mutation.unlock()
+    }
+    try store.authorize(grant)
+    // 系统提交包含异步等待，不能依据旧界面选择删除后来被替换、移动或增加配套资源的条目。
+    guard !expected.isFolder, expected.photoAsset == nil,
+      expected.isImage || expected.isVideo,
+      try rawReader(id: expected.id, using: grant).media == expected
+    else {
+      throw VaultError.documentChanged
+    }
+    try Task.checkCancellation()
+    try delete(id: expected.id, using: grant)
   }
 
   /// 业务作用：为一次明确的系统复制建立独立事务，不沿用普通浏览时已经输入的目录密码。

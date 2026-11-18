@@ -775,18 +775,27 @@ final class PhotoVaultService: @unchecked Sendable {
     (error as? VaultError)?.errorDescription ?? "系统拒绝或取消了删除，原件未确认移除。"
   }
 
-  /// 业务作用：用户明确确认后按原名解密保存到系统照片，并复验新资产的完整内容。
+  /// 业务作用：按原名保存并完整复验系统照片，成功后移除同一单一媒体的保险箱原件。
   /// 参数说明：
   /// - `media`：已解锁列表中的媒体。
   /// - `grant`：当前独立密码会话。
-  /// 返回：新相册资产已按原名完整保存；提交后无法复验时明确提示系统中可能已有副本。
+  /// 返回：系统资产完整保存且原件移除后成功；复验失败保留原件，删源结果不明时明确报告。
   func export(_ media: VaultMedia, using grant: VaultGrant) async throws {
-    let primary = try library.presentationReader(id: media.id, using: grant).media
-    let presented = VaultMedia(
-      id: media.id, originalFilename: media.originalFilename, contentType: primary.contentType,
-      byteCount: primary.byteCount, sha256: primary.sha256, parentID: media.parentID)
-    try await saveToPhotos(presented, using: grant) { stage in
+    let original = try library.reader(id: media.id, using: grant).media
+    // 相册单资源写入不能无损恢复复合照片，权限申请前就拒绝，以免删掉未交付的配套资源。
+    guard !original.isFolder, original.photoAsset == nil,
+      original.isImage || original.isVideo
+    else {
+      throw VaultError.compositePhoto
+    }
+    try await saveToPhotos(original, using: grant) { stage in
       try self.library.exportPresentation(id: media.id, to: stage, using: grant)
+    }
+    do {
+      // 系统事务成功与完整摘要复验先于删源；复制入口只共用保存步骤，不会进入此处。
+      try library.removeExportedPhoto(original, using: grant)
+    } catch {
+      throw VaultError.exportRemovalUncertain
     }
   }
 

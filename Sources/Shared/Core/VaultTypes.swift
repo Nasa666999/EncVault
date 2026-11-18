@@ -192,6 +192,7 @@ enum VaultError: Error, LocalizedError, Sendable {
   case compositePhoto
   case photoChange
   case systemExportUncertain
+  case exportRemovalUncertain
   case documentTooLarge
   case textEncoding
   case documentChanged
@@ -300,6 +301,8 @@ enum VaultError: Error, LocalizedError, Sendable {
       return "系统未能确认相册操作完成，请检查系统照片；保险箱内的加密文件保留。"
     case .systemExportUncertain:
       return "系统照片中可能已生成明文副本，但未能完成复验。请检查相册；保险箱密文保留。"
+    case .exportRemovalUncertain:
+      return "系统副本已完整保存并校验，但保险箱原件未能全部确认移除。请检查当前目录，避免重复导出。"
     case .documentTooLarge:
       return "文档超过只读预览上限（文本 8 MiB，其它文档或文件包 512 MiB），仍可按原名解密导出。"
     case .textEncoding:

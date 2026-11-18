@@ -11,7 +11,7 @@ import SwiftUI
   typealias VaultImage = UIImage
 #endif
 
-/// 两种系统保存入口均保留原件，受保护内容的复制与导出采用不同目录规则。
+/// 系统复制保留原件；导出完整校验成功后删除原件，受保护内容禁止导出。
 enum SystemSaveAction: String, CaseIterable, Sendable {
   case copy = "复制"
   case export = "导出"
@@ -1268,9 +1268,14 @@ final class VaultModel: ObservableObject {
           folderID = previousFolderID
           notice = "已删除保险箱内的加密文件。"
         case .export(let media, let directory):
-          _ = try library.export(id: media.id, to: directory, using: grant)
+          do {
+            _ = try library.export(id: media.id, to: directory, using: grant)
+            notice = "已按原名导出到系统，并移除保险箱内原件。系统中的文件未加密。"
+          } catch VaultError.exportRemovalUncertain {
+            // 系统副本已经完成，仍需重新枚举实际剩余密文，不能让清理失败留下已删除条目的旧列表。
+            notice = VaultError.exportRemovalUncertain.localizedDescription
+          }
           folderID = previousFolderID
-          notice = "已按原名导出到系统，保险箱内原件保留。系统中的副本不再受保险箱密码保护。"
         case .move, .movePath:
           let result = try library.move(
             ids: action.sources.map(\.id), to: moveParentID,
@@ -1938,11 +1943,11 @@ final class VaultModel: ObservableObject {
     runFolderAction(.rename(media, name))
   }
 
-  /// 业务作用：将用户确认导出的文件按原名保存到系统目录，保险箱密文继续保留。
+  /// 业务作用：将用户确认导出的文件完整保存到系统目录并校验，成功后删除保险箱原件。
   /// 参数说明：
   /// - `media`：用户明确选择的媒体。
   /// - `directory`：系统选择器授权的目标目录。
-  /// 返回：完整导出时显示提示；失败不覆盖原有同名文件。
+  /// 返回：导出并删源后刷新列表；写入失败保留原件，清理不明时显示实际剩余列表及原因。
   func export(_ media: VaultMedia, to directory: URL) {
     runFolderAction(.export(media, directory))
   }
@@ -1956,10 +1961,10 @@ final class VaultModel: ObservableObject {
     beginSystemCopy(media, destination: .directory(directory))
   }
 
-  /// 业务作用：用户确认后将选中媒体按原名解密保存到系统照片，不删除保险箱副本。
+  /// 业务作用：用户确认后将单一媒体完整保存到系统照片，复验成功后删除保险箱原件。
   /// 参数说明：
   /// - `media`：当前明确选择的已认证媒体。
-  /// 返回：系统保存与完整复验成功时提示；权限拒绝或无法确认时保留密文。
+  /// 返回：系统保存、复验和删源完成后刷新列表；复合照片需通过本地目录完整导出。
   func exportToPhotos(_ media: VaultMedia) {
     saveToPhotos(media)
   }
@@ -2084,12 +2089,12 @@ final class VaultModel: ObservableObject {
     pendingCopy = nil
   }
 
-  /// 业务作用：保持原有系统照片导出入口的原名复验和受保护内容禁止导出规则。
+  /// 业务作用：在保护检查后导出单一系统照片，完整复验后删源并刷新当前目录。
   /// 参数说明：
   /// - `media`：本次明确选择的图片或视频。
-  /// 返回：已解锁且不受目录保护时开始保存；拒绝时不申请照片权限或生成外部明文。
+  /// 返回：成功后原件从列表消失；受保护或复合资源拒绝，写入失败保留原件，清理不明时明确提示。
   private func saveToPhotos(_ media: VaultMedia) {
-    guard let photos, let grant, screen == .library, !busy,
+    guard let photos, let library, let grant, screen == .library, !busy,
       media.isImage || media.isVideo
     else {
       return
@@ -2099,15 +2104,30 @@ final class VaultModel: ObservableObject {
       message = VaultError.protectedFolderExport.localizedDescription
       return
     }
+    // 复合照片必须完整交付配套资源；系统相册单资源入口不能承担删源导出。
+    guard media.photoAsset == nil else {
+      message = "此照片包含配套资源，请选择本地目录完整导出；完整保存并校验后再移除保险箱原件。"
+      return
+    }
     guard closeViewer() else {
       return
     }
+    clearThumbnails()
     perform(
       {
-        try await photos.export(media, using: grant)
+        let notice: String
+        do {
+          try await photos.export(media, using: grant)
+          notice = "已按原名导出到系统照片，并移除保险箱内原件。相册中的文件未加密。"
+        } catch VaultError.exportRemovalUncertain {
+          notice = VaultError.exportRemovalUncertain.localizedDescription
+        }
+        return (try library.list(using: grant), notice)
       },
-      success: { [weak self] in
-        self?.message = "已按原名导出到系统照片，保险箱内原件保留。相册中的明文副本不再受保险箱密码保护。"
+      success: { [weak self] items, notice in
+        self?.items = items
+        self?.clearThumbnails()
+        self?.message = notice
       })
   }
 
